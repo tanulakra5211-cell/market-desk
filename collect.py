@@ -215,6 +215,102 @@ def collect_flows(client: httpx.Client) -> bool:
 
 
 
+
+FNO_DIR = Path(__file__).parent / "data" / "fno"
+LOTS_PATH = Path(__file__).parent / "data" / "lot_sizes.csv"
+
+# The F&O bhavcopy: every contract on every underlying in one file. Far better
+# than the per-symbol option-chain API, which needs one request per stock and
+# gets throttled long before covering the whole F&O universe.
+FNO_BHAV_URL = (
+    "https://nsearchives.nseindia.com/content/fo/"
+    "BhavCopy_NSE_FO_0_0_0_{yyyymmdd}_F_0000.csv.zip"
+)
+
+
+def fetch_fno_bhav(client: httpx.Client, date: datetime):
+    """Every F&O contract for one trading day. Returns (df, note)."""
+    url = FNO_BHAV_URL.format(yyyymmdd=date.strftime("%Y%m%d"))
+    headers = {"Referer": "https://www.nseindia.com/all-reports-derivatives",
+               "Accept": "application/zip,text/csv,*/*"}
+    try:
+        resp = client.get(url, headers=headers)
+        if resp.status_code != 200:
+            return None, f"HTTP {resp.status_code}"
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+            raw = pd.read_csv(zf.open(zf.namelist()[0]), skipinitialspace=True)
+    except Exception as exc:  # noqa: BLE001
+        return None, f"{type(exc).__name__}: {str(exc)[:70]}"
+
+    raw.columns = [c.strip() for c in raw.columns]
+    keep = {
+        "TckrSymb": "SYMBOL", "FinInstrmTp": "TYPE", "XpryDt": "EXPIRY",
+        "StrkPric": "STRIKE", "OptnTp": "OPT", "ClsPric": "CLOSE",
+        "PrvsClsgPric": "PREV_CLOSE", "UndrlygPric": "UNDERLYING",
+        "OpnIntrst": "OI", "ChngInOpnIntrst": "CHG_OI",
+        "TtlTradgVol": "VOLUME", "NewBrdLotQty": "LOT_SIZE",
+    }
+    have = {k: v for k, v in keep.items() if k in raw.columns}
+    if "TckrSymb" not in have:
+        return None, f"unexpected columns: {list(raw.columns)[:10]}"
+
+    df = raw[list(have)].rename(columns=have)
+    for c in ["STRIKE", "CLOSE", "PREV_CLOSE", "UNDERLYING", "OI", "CHG_OI",
+              "VOLUME", "LOT_SIZE"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["DATE"] = date.strftime("%Y-%m-%d")
+    return df, "ok"
+
+
+def store_lot_sizes(df: pd.DataFrame) -> None:
+    """Lot sizes straight from the exchange file — no hardcoded table to rot."""
+    if "LOT_SIZE" not in df.columns:
+        return
+    lots = (df.dropna(subset=["LOT_SIZE"])
+              .groupby("SYMBOL")["LOT_SIZE"].max().reset_index())
+    lots.columns = ["SYMBOL", "LOT_SIZE"]
+    LOTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lots.to_csv(LOTS_PATH, index=False)
+    print(f"    lot sizes: {len(lots)} underlyings")
+
+
+def collect_fno(client: httpx.Client, max_lookback: int = 6) -> bool:
+    """
+    One request gives the entire F&O market — every underlying, every strike,
+    every expiry. Stored monthly like the equity bhavcopy.
+    """
+    FNO_DIR.mkdir(parents=True, exist_ok=True)
+
+    for offset in range(max_lookback):
+        day = datetime.now() - timedelta(days=offset)
+        if day.weekday() >= 5:
+            continue
+        df, note = fetch_fno_bhav(client, day)
+        if df is None:
+            print(f"    {day:%Y-%m-%d}: {note}")
+            time.sleep(0.4)
+            continue
+
+        stamp = day.strftime("%Y-%m-%d")
+        opts = df[df["TYPE"].isin(["STO", "IDO"])] if "TYPE" in df.columns else df
+        print(f"    {stamp}: {len(df):,} contracts "
+              f"({df['SYMBOL'].nunique()} underlyings, {len(opts):,} options)")
+
+        path = FNO_DIR / f"{stamp[:7]}.csv.gz"
+        if path.exists():
+            prev = pd.read_csv(path, skipinitialspace=True)
+            prev = prev[prev["DATE"] != stamp]
+            df = pd.concat([prev, df], ignore_index=True)
+        df.to_csv(path, index=False, compression="gzip")
+
+        store_lot_sizes(df[df["DATE"] == stamp])
+        return True
+
+    print("    no F&O bhavcopy available in the lookback window")
+    return False
+
+
 OPTIONS_DIR = Path(__file__).parent / "data" / "options"
 IV_PATH = Path(__file__).parent / "data" / "iv_history.csv"
 
@@ -437,7 +533,10 @@ def main() -> int:
         client = make_client()
         collect_flows(client)
 
-        print("\nCollecting option chains…")
+        print("\nCollecting F&O bhavcopy (all underlyings)…")
+        collect_fno(client)
+
+        print("\nCollecting option chains for implied volatility…")
         collect_options(client)
         client.close()
         return 0
@@ -505,7 +604,10 @@ def main() -> int:
     print("\nCollecting FII/DII flows…")
     collect_flows(client)
 
-    print("\nCollecting option chains…")
+    print("\nCollecting F&O bhavcopy (all underlyings)…")
+    collect_fno(client)
+
+    print("\nCollecting option chains for implied volatility…")
     collect_options(client)
 
     client.close()
