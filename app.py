@@ -1807,14 +1807,97 @@ with tab_test:
             unsafe_allow_html=True,
         )
         st.markdown(
-            """
-            **To start collecting:** the repo includes a GitHub Action that runs
-            every weekday at 19:30 IST, fetches that day's bhavcopy and commits it.
-            Go to your repo's **Actions** tab, pick *Collect bhavcopy*, click
-            **Run workflow**, and enter `400` in the backfill box to seed roughly
-            a year and a half of history in one go. After that it maintains itself.
-            """
+            "GitHub's servers are blocked by NSE, but **this app is not** — the "
+            "Screener and Technicals tabs are fetching successfully. So collect "
+            "the history here, download it, and commit it to your repo once."
         )
+
+        st.divider()
+        st.markdown("**Build the history file**")
+
+        bf_days = st.select_slider(
+            "How far back", options=[90, 180, 270, 400, 550, 730], value=400,
+            help="Calendar days. 400 is about 18 months and takes roughly "
+                 "5-8 minutes. Start smaller if you want to check it works first.",
+        )
+        st.caption(
+            f"Roughly {int(bf_days * 5 / 7)} trading days. Requests are throttled "
+            "to stay under NSE's rate limit, so this is slow by design. Leave the "
+            "tab open while it runs."
+        )
+
+        if st.button("Collect history now", type="primary"):
+            bar = st.progress(0.0, text="Starting…")
+            status = st.empty()
+            frames, ok, miss = [], 0, 0
+
+            for i in range(bf_days):
+                day = datetime.now() - timedelta(days=i)
+                if day.weekday() >= 5:
+                    continue
+                bar.progress(min(i / bf_days, 1.0),
+                             text=f"{day:%d %b %Y} — {ok} days collected, {miss} skipped")
+                df = _fetch_bhav_for(day)
+                if df.empty:
+                    miss += 1
+                else:
+                    if "SERIES" in df.columns:
+                        df = df[df["SERIES"].astype(str).str.strip().str.upper() == "EQ"]
+                    frames.append(pd.DataFrame({
+                        "DATE": day.strftime("%Y-%m-%d"),
+                        "SYMBOL": df["SYMBOL"],
+                        "CLOSE": pd.to_numeric(df.get("CLOSE_PRICE"), errors="coerce"),
+                        "PREV_CLOSE": pd.to_numeric(df.get("PREV_CLOSE"), errors="coerce"),
+                        "VOLUME": pd.to_numeric(df.get("TTL_TRD_QNTY"), errors="coerce"),
+                        "TURNOVER_LACS": pd.to_numeric(df.get("TURNOVER_LACS"), errors="coerce"),
+                        "DELIV_QTY": pd.to_numeric(df.get("DELIV_QTY"), errors="coerce"),
+                        "DELIV_PER": pd.to_numeric(df.get("DELIV_PER"), errors="coerce"),
+                    }).dropna(subset=["CLOSE"]))
+                    ok += 1
+                time.sleep(0.35)
+
+            bar.empty()
+            if not frames:
+                status.error(
+                    "Nothing collected. Check the Screener tab's fetch log — if "
+                    "that is also failing, NSE is refusing this server too."
+                )
+            else:
+                collected = pd.concat(frames, ignore_index=True)
+                st.session_state["_collected"] = collected
+                status.success(
+                    f"{ok} trading days collected, {miss} unavailable "
+                    f"(holidays and refusals). {len(collected):,} rows."
+                )
+
+        collected = st.session_state.get("_collected", pd.DataFrame())
+        if not collected.empty:
+            st.divider()
+            st.markdown("**Save it to your repo**")
+
+            months = sorted(collected["DATE"].str[:7].unique())
+            st.caption(
+                f"{len(months)} monthly files, {collected['SYMBOL'].nunique():,} "
+                "distinct symbols. Download each and upload them into a "
+                "`data/history/` folder in your repo."
+            )
+
+            for m in months:
+                chunk = collected[collected["DATE"].str[:7] == m].sort_values(
+                    ["DATE", "SYMBOL"])
+                buf = io.BytesIO()
+                chunk.to_csv(buf, index=False, compression="gzip")
+                st.download_button(
+                    f"{m}.csv.gz  ·  {len(chunk):,} rows",
+                    data=buf.getvalue(), file_name=f"{m}.csv.gz",
+                    mime="application/gzip", key=f"dl_{m}",
+                )
+
+            st.markdown(
+                "In GitHub: **Add file → Upload files**, drag all of these in, and "
+                "set the path to `data/history/` before committing. Refresh this "
+                "app afterwards and the backtest becomes available."
+            )
     else:
         dates = sorted(hist["DATE"].unique())
         span_days = (dates[-1] - dates[0]).days
