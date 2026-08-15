@@ -21,6 +21,7 @@ the survivorship bias that makes backtests lie.
 
 import argparse
 import io
+import re
 import sys
 import time
 import zipfile
@@ -215,6 +216,154 @@ def collect_flows(client: httpx.Client) -> bool:
 
 
 
+
+
+
+SHP_PATH = Path(__file__).parent / "data" / "shareholding.csv"
+MF_PATH = Path(__file__).parent / "data" / "mf_holdings.csv"
+
+# Symbols to track shareholding for. Per-company requests, so this is a list
+# rather than the whole market. Quarterly data, so a weekly run is plenty.
+SHP_SYMBOLS = [
+    "RELIANCE", "HDFCBANK", "TCS", "INFY", "ICICIBANK", "LT", "ITC", "SBIN",
+    "BHARTIARTL", "RVNL", "IRCON", "BEL", "HAL", "NBCC", "PIIND", "CUPID",
+]
+
+
+def _num(v):
+    """NSE mixes numbers, strings and dashes in the same field."""
+    try:
+        s = str(v).replace(",", "").replace("%", "").strip()
+        return float(s) if s and s not in ("-", "NA", "None") else float("nan")
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def fetch_shareholding(client: httpx.Client, symbol: str):
+    """
+    One company's quarterly shareholding pattern.
+
+    NSE has moved this endpoint before, so several known paths are tried and
+    the one that answers is reported. Parsing is deliberately loose because
+    the field names differ between them.
+    """
+    paths = [
+        f"/api/corporate-share-holdings-master?index=equities&symbol={symbol}",
+        f"/api/corporate-shareHoldings?index=equities&symbol={symbol}",
+        f"/api/quote-equity?symbol={symbol}&section=corp_info",
+    ]
+    for path in paths:
+        payload, note = nse_api(client, path,
+                                f"/get-quotes/equity?symbol={symbol}")
+        if payload is None:
+            continue
+
+        data = payload
+        for key in ("data", "shareholdingPatterns", "corpInfo"):
+            if isinstance(data, dict) and key in data:
+                data = data[key]
+        if isinstance(data, dict):
+            data = data.get("data", list(data.values()))
+        if not isinstance(data, list) or not data:
+            continue
+
+        rows = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            period = _pick(item, "date", "period", "asOnDate", "quarter", "name")
+            if not period:
+                continue
+            rows.append({
+                "SYMBOL": symbol,
+                "PERIOD": period,
+                "PROMOTER_%": _num(_pick(item, "promoter", "promoterAndPromoterGroup",
+                                         "pr_and_prgrp", default="")),
+                "PLEDGED_%": _num(_pick(item, "pledged", "promoterPledge",
+                                        "sharesPledged", default="")),
+                "FII_%": _num(_pick(item, "fii", "foreignPortfolioInvestors",
+                                    "fpi", default="")),
+                "DII_%": _num(_pick(item, "dii", "domesticInstitutional",
+                                    default="")),
+                "MF_%": _num(_pick(item, "mutualFunds", "mf", default="")),
+                "PUBLIC_%": _num(_pick(item, "public", "publicShareholding",
+                                       default="")),
+                "SOURCE": path.split("?")[0],
+            })
+        if rows:
+            return pd.DataFrame(rows), f"ok via {path.split('?')[0]}"
+
+    return None, "no endpoint returned parseable shareholding data"
+
+
+def collect_shareholding(client: httpx.Client) -> int:
+    """
+    Quarterly ownership, per company.
+
+    The single filing is not the point -- the history is. A promoter stake
+    creeping up over three quarters, or institutional holding going from 2% to
+    9% in a smallcap, is a slow signal that survives being public precisely
+    because it is slow. That history only exists if you collect it.
+    """
+    total, failures = 0, []
+    for symbol in SHP_SYMBOLS:
+        df, note = fetch_shareholding(client, symbol)
+        if df is None:
+            failures.append(f"{symbol}: {note}")
+        else:
+            n = _append_csv(SHP_PATH, df, ["SYMBOL", "PERIOD"])
+            total += n
+            print(f"    {symbol}: {len(df)} periods, {n} new")
+        time.sleep(0.6)
+
+    if failures:
+        print(f"    {len(failures)} symbol(s) returned nothing:")
+        for f in failures[:4]:
+            print(f"      {f}")
+    return total
+
+
+AMFI_PORTFOLIO_INDEX = "https://www.amfiindia.com/research-information/other-data/monthly-portfolio-disclosures"
+
+
+def collect_mf_disclosure_links(client: httpx.Client) -> int:
+    """
+    Monthly mutual fund portfolio disclosures.
+
+    Honest warning: AMFI publishes an index page of links, and each AMC then
+    posts its own spreadsheet in its own layout. There is no common schema, so
+    this collects the LINKS and leaves the parsing to you rather than
+    pretending to a standardisation that does not exist. Scheme-level holdings
+    genuinely require per-AMC work.
+
+    The aggregate picture -- how much of a company mutual funds own -- comes
+    from the shareholding pattern above and is far more reliable.
+    """
+    try:
+        resp = client.get(AMFI_PORTFOLIO_INDEX,
+                          headers={"Referer": "https://www.amfiindia.com/"})
+        if resp.status_code != 200:
+            print(f"    AMFI index: HTTP {resp.status_code}")
+            return 0
+        html = resp.text
+    except Exception as exc:  # noqa: BLE001
+        print(f"    AMFI index: {type(exc).__name__}: {str(exc)[:60]}")
+        return 0
+
+    links = re.findall(r'href="([^"]+\.(?:xls|xlsx|csv|zip))"[^>]*>([^<]{3,120})<',
+                       html, flags=re.I)
+    if not links:
+        print("    AMFI index: no disclosure links found — page layout may have changed")
+        return 0
+
+    rows = [{"COLLECTED": datetime.now().strftime("%Y-%m-%d"),
+             "AMC": label.strip()[:120],
+             "URL": url if url.startswith("http") else f"https://www.amfiindia.com{url}"}
+            for url, label in links]
+    df = pd.DataFrame(rows)
+    n = _append_csv(MF_PATH, df, ["URL"])
+    print(f"    AMFI disclosures: {len(df)} links, {n} new")
+    return n
 
 
 DEALS_PATH = Path(__file__).parent / "data" / "deals.csv"
@@ -728,6 +877,10 @@ def main() -> int:
         collect_deals(client)
         collect_insider(client)
 
+        print("\nCollecting shareholding patterns…")
+        collect_shareholding(client)
+        collect_mf_disclosure_links(client)
+
         print("\nCollecting corporate calendar…")
         collect_corporate_actions(client)
         collect_board_meetings(client)
@@ -806,6 +959,10 @@ def main() -> int:
     print("\nCollecting deals and disclosures…")
     collect_deals(client)
     collect_insider(client)
+
+    print("\nCollecting shareholding patterns…")
+    collect_shareholding(client)
+    collect_mf_disclosure_links(client)
 
     print("\nCollecting corporate calendar…")
     collect_corporate_actions(client)
