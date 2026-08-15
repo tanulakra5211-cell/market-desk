@@ -216,6 +216,197 @@ def collect_flows(client: httpx.Client) -> bool:
 
 
 
+
+DEALS_PATH = Path(__file__).parent / "data" / "deals.csv"
+INSIDER_PATH = Path(__file__).parent / "data" / "insider.csv"
+ACTIONS_PATH = Path(__file__).parent / "data" / "corporate_actions.csv"
+MEETINGS_PATH = Path(__file__).parent / "data" / "board_meetings.csv"
+
+
+def nse_api(client: httpx.Client, path: str, referer: str = "/"):
+    """GET an NSE /api/ endpoint with the right referer. Returns JSON or None."""
+    try:
+        resp = client.get(f"{NSE_BASE}{path}",
+                          headers={"Referer": f"{NSE_BASE}{referer}"})
+        if resp.status_code != 200:
+            return None, f"HTTP {resp.status_code}"
+        return resp.json(), "ok"
+    except Exception as exc:  # noqa: BLE001
+        return None, f"{type(exc).__name__}: {str(exc)[:60]}"
+
+
+def _append_csv(path: Path, new: pd.DataFrame, keys: list) -> int:
+    """Append rows, dropping ones already stored. Returns how many were new."""
+    if new.empty:
+        return 0
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        prev = pd.read_csv(path, skipinitialspace=True, dtype=str)
+        before = len(prev)
+        combined = pd.concat([prev, new.astype(str)], ignore_index=True)
+        combined = combined.drop_duplicates(subset=[k for k in keys
+                                                    if k in combined.columns])
+        added = len(combined) - before
+    else:
+        combined = new.astype(str).drop_duplicates(
+            subset=[k for k in keys if k in new.columns])
+        added = len(combined)
+    combined.to_csv(path, index=False)
+    return added
+
+
+def _pick(row: dict, *names, default=""):
+    """NSE renames response fields between endpoints; take the first that exists."""
+    for n in names:
+        if n in row and row[n] not in (None, ""):
+            return row[n]
+    return default
+
+
+def collect_deals(client: httpx.Client, days_back: int = 7) -> int:
+    """
+    Bulk and block deals — every trade above half a percent of equity, named.
+
+    This is the closest thing to seeing who is actually buying. A promoter or
+    a known fund appearing on the buy side is a disclosure, not a rumour, and
+    it lands here before it reaches any headline.
+    """
+    end = datetime.now()
+    start = end - timedelta(days=days_back)
+    span = f"from={start:%d-%m-%Y}&to={end:%d-%m-%Y}"
+    total = 0
+
+    for kind, path in [("bulk", f"/api/historical/bulk-deals?{span}"),
+                       ("block", f"/api/historical/block-deals?{span}")]:
+        payload, note = nse_api(client, path, "/report-detail/display-bulk-and-block-deals")
+        if payload is None:
+            print(f"    {kind} deals: {note}")
+            time.sleep(0.5)
+            continue
+
+        data = payload.get("data", []) if isinstance(payload, dict) else payload
+        rows = []
+        for item in data or []:
+            rows.append({
+                "DATE": _pick(item, "BD_DT_DATE", "date", "mDate"),
+                "TYPE": kind,
+                "SYMBOL": _pick(item, "BD_SYMBOL", "symbol"),
+                "COMPANY": _pick(item, "BD_SCRIP_NAME", "scripName"),
+                "CLIENT": _pick(item, "BD_CLIENT_NAME", "clientName"),
+                "SIDE": _pick(item, "BD_BUY_SELL", "buySell"),
+                "QTY": _pick(item, "BD_QTY_TRD", "quantityTraded"),
+                "PRICE": _pick(item, "BD_TP_WATP", "tradePrice", "watp"),
+                "REMARKS": _pick(item, "BD_REMARKS", "remarks"),
+            })
+        df = pd.DataFrame(rows)
+        n = _append_csv(DEALS_PATH, df, ["DATE", "SYMBOL", "CLIENT", "SIDE", "QTY"])
+        print(f"    {kind} deals: {len(df)} fetched, {n} new")
+        total += n
+        time.sleep(0.5)
+
+    return total
+
+
+def collect_insider(client: httpx.Client, days_back: int = 14) -> int:
+    """
+    Insider trading disclosures under SEBI Regulation 7(2).
+
+    Promoters and designated persons must report their own dealings. Promoter
+    buying is one of the few genuinely informative signals in a small cap --
+    and pledging shows up here too, which the fundamentals screen cannot see.
+    """
+    end = datetime.now()
+    start = end - timedelta(days=days_back)
+    path = (f"/api/corporates-pit?index=equities"
+            f"&from_date={start:%d-%m-%Y}&to_date={end:%d-%m-%Y}")
+    payload, note = nse_api(client, path, "/companies-listing/corporate-filings-insider-trading")
+    if payload is None:
+        print(f"    insider filings: {note}")
+        return 0
+
+    data = payload.get("data", []) if isinstance(payload, dict) else payload
+    rows = []
+    for item in data or []:
+        rows.append({
+            "DATE": _pick(item, "date", "acqfromDt", "intimDt"),
+            "SYMBOL": _pick(item, "symbol"),
+            "COMPANY": _pick(item, "company"),
+            "PERSON": _pick(item, "acqName"),
+            "CATEGORY": _pick(item, "personCategory", "anex"),
+            "TRANSACTION": _pick(item, "tdpTransactionType"),
+            "SECURITY": _pick(item, "secType"),
+            "QTY": _pick(item, "secAcq"),
+            "VALUE": _pick(item, "secVal"),
+            "MODE": _pick(item, "acqMode"),
+            "HOLDING_BEFORE": _pick(item, "befAcqSharesNo"),
+            "HOLDING_AFTER": _pick(item, "afterAcqSharesNo"),
+        })
+    df = pd.DataFrame(rows)
+    n = _append_csv(INSIDER_PATH, df, ["DATE", "SYMBOL", "PERSON", "QTY", "TRANSACTION"])
+    print(f"    insider filings: {len(df)} fetched, {n} new")
+    return n
+
+
+def collect_corporate_actions(client: httpx.Client, days_ahead: int = 60) -> int:
+    """Ex-dates for dividends, splits, bonuses and rights."""
+    start = datetime.now() - timedelta(days=7)
+    end = datetime.now() + timedelta(days=days_ahead)
+    path = (f"/api/corporates-corporateActions?index=equities"
+            f"&from_date={start:%d-%m-%Y}&to_date={end:%d-%m-%Y}")
+    payload, note = nse_api(client, path, "/companies-listing/corporate-filings-actions")
+    if payload is None:
+        print(f"    corporate actions: {note}")
+        return 0
+
+    data = payload.get("data", []) if isinstance(payload, dict) else payload
+    rows = []
+    for item in data or []:
+        rows.append({
+            "SYMBOL": _pick(item, "symbol"),
+            "COMPANY": _pick(item, "comp", "company"),
+            "PURPOSE": _pick(item, "subject", "purpose"),
+            "EX_DATE": _pick(item, "exDate", "ex_date"),
+            "RECORD_DATE": _pick(item, "recDate", "recordDate"),
+            "FACE_VALUE": _pick(item, "faceVal"),
+        })
+    df = pd.DataFrame(rows)
+    n = _append_csv(ACTIONS_PATH, df, ["SYMBOL", "PURPOSE", "EX_DATE"])
+    print(f"    corporate actions: {len(df)} fetched, {n} new")
+    return n
+
+
+def collect_board_meetings(client: httpx.Client, days_ahead: int = 45) -> int:
+    """
+    Board meeting dates — which is to say, when each company reports results.
+
+    This matters most for options: an earnings date inside your holding period
+    is exactly when implied volatility collapses.
+    """
+    start = datetime.now() - timedelta(days=3)
+    end = datetime.now() + timedelta(days=days_ahead)
+    path = (f"/api/corporate-board-meetings?index=equities"
+            f"&from_date={start:%d-%m-%Y}&to_date={end:%d-%m-%Y}")
+    payload, note = nse_api(client, path, "/companies-listing/corporate-filings-board-meetings")
+    if payload is None:
+        print(f"    board meetings: {note}")
+        return 0
+
+    data = payload.get("data", []) if isinstance(payload, dict) else payload
+    rows = []
+    for item in data or []:
+        rows.append({
+            "SYMBOL": _pick(item, "bm_symbol", "symbol"),
+            "COMPANY": _pick(item, "sm_name", "company"),
+            "MEETING_DATE": _pick(item, "bm_date"),
+            "PURPOSE": _pick(item, "bm_purpose"),
+            "DETAILS": str(_pick(item, "bm_desc"))[:300],
+        })
+    df = pd.DataFrame(rows)
+    n = _append_csv(MEETINGS_PATH, df, ["SYMBOL", "MEETING_DATE", "PURPOSE"])
+    print(f"    board meetings: {len(df)} fetched, {n} new")
+    return n
+
+
 FNO_DIR = Path(__file__).parent / "data" / "fno"
 LOTS_PATH = Path(__file__).parent / "data" / "lot_sizes.csv"
 
@@ -533,6 +724,14 @@ def main() -> int:
         client = make_client()
         collect_flows(client)
 
+        print("\nCollecting deals and disclosures…")
+        collect_deals(client)
+        collect_insider(client)
+
+        print("\nCollecting corporate calendar…")
+        collect_corporate_actions(client)
+        collect_board_meetings(client)
+
         print("\nCollecting F&O bhavcopy (all underlyings)…")
         collect_fno(client)
 
@@ -603,6 +802,14 @@ def main() -> int:
     # where every bhavcopy date was already on disk.
     print("\nCollecting FII/DII flows…")
     collect_flows(client)
+
+    print("\nCollecting deals and disclosures…")
+    collect_deals(client)
+    collect_insider(client)
+
+    print("\nCollecting corporate calendar…")
+    collect_corporate_actions(client)
+    collect_board_meetings(client)
 
     print("\nCollecting F&O bhavcopy (all underlyings)…")
     collect_fno(client)
