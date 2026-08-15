@@ -413,6 +413,138 @@ def summarise_flows(cash: pd.DataFrame) -> dict:
     return out
 
 
+# ====================================================== FULL NSE UNIVERSE ====
+# Fetching 2,000+ companies one at a time is not viable. Instead NSE publishes
+# a single daily file covering every security that traded -- the bhavcopy.
+# One request gives you the whole market. Screen on that, then pull expensive
+# per-company fundamentals only for the handful that survive your filters.
+
+EQUITY_LIST_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
+
+# Full security-wise file: includes delivery quantity and delivery percentage,
+# which the plain UDiFF bhavcopy does not carry.
+SEC_BHAV_URL = (
+    "https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{ddmmyyyy}.csv"
+)
+
+# UDiFF common bhavcopy -- fallback. The pre-July-2024 URL is discontinued.
+UDIFF_URL = (
+    "https://nsearchives.nseindia.com/content/cm/"
+    "BhavCopy_NSE_CM_0_0_0_{yyyymmdd}_F_0000.csv.zip"
+)
+
+
+def fetch_nse_universe() -> pd.DataFrame:
+    """Every equity listed on NSE: symbol, name, series, listing date, ISIN."""
+    sess = get_nse_session()
+    try:
+        if not sess._primed:
+            sess._prime()
+        resp = sess._client.get(EQUITY_LIST_URL)
+        resp.raise_for_status()
+        df = pd.read_csv(io.StringIO(resp.text))
+    except Exception:
+        return pd.DataFrame()
+
+    df.columns = [c.strip() for c in df.columns]
+    rename = {
+        "SYMBOL": "Symbol",
+        "NAME OF COMPANY": "Company",
+        "SERIES": "Series",
+        " SERIES": "Series",
+        "DATE OF LISTING": "Listed",
+        " DATE OF LISTING": "Listed",
+        "ISIN NUMBER": "ISIN",
+        " ISIN NUMBER": "ISIN",
+        "FACE VALUE": "Face Value",
+        " FACE VALUE": "Face Value",
+    }
+    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+    keep = [c for c in ["Symbol", "Company", "Series", "Listed", "ISIN"] if c in df.columns]
+    return df[keep]
+
+
+def _fetch_bhav_for(date: datetime) -> pd.DataFrame:
+    """One trading day's full-market data. Empty frame if not a trading day."""
+    sess = get_nse_session()
+    try:
+        if not sess._primed:
+            sess._prime()
+    except Exception:
+        return pd.DataFrame()
+
+    url = SEC_BHAV_URL.format(ddmmyyyy=date.strftime("%d%m%Y"))
+    try:
+        resp = sess._client.get(url)
+        if resp.status_code != 200:
+            return pd.DataFrame()
+        df = pd.read_csv(io.StringIO(resp.text))
+    except Exception:
+        return pd.DataFrame()
+
+    df.columns = [c.strip() for c in df.columns]
+    for col in df.columns:
+        if df[col].dtype == object:
+            df[col] = df[col].astype(str).str.strip()
+
+    numeric = ["PREV_CLOSE", "OPEN_PRICE", "HIGH_PRICE", "LOW_PRICE", "LAST_PRICE",
+               "CLOSE_PRICE", "AVG_PRICE", "TTL_TRD_QNTY", "TURNOVER_LACS",
+               "NO_OF_TRADES", "DELIV_QTY", "DELIV_PER"]
+    for col in numeric:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["TRADE_DATE"] = date.date()
+    return df
+
+
+def fetch_latest_bhavcopy(max_lookback: int = 7):
+    """
+    Walk backwards from today until a trading day's file is found.
+    Returns (dataframe, date) or (empty, None).
+    """
+    for offset in range(max_lookback):
+        day = datetime.now() - timedelta(days=offset)
+        if day.weekday() >= 5:
+            continue
+        df = _fetch_bhav_for(day)
+        if not df.empty:
+            return df, day.date()
+        time.sleep(0.4)
+    return pd.DataFrame(), None
+
+
+def build_market_screen(latest: pd.DataFrame, prior: pd.DataFrame) -> pd.DataFrame:
+    """
+    Whole-market screening table. Day change comes from the file's own
+    PREV_CLOSE; the 1M column is computed against an older bhavcopy if one
+    was retrieved.
+    """
+    if latest.empty:
+        return pd.DataFrame()
+
+    df = latest[latest.get("SERIES", "EQ") == "EQ"].copy()
+
+    out = pd.DataFrame({
+        "Symbol": df["SYMBOL"],
+        "Close": df["CLOSE_PRICE"],
+        "Day %": ((df["CLOSE_PRICE"] - df["PREV_CLOSE"]) / df["PREV_CLOSE"]) * 100,
+        "Volume": df["TTL_TRD_QNTY"],
+        "Turnover (Cr)": df["TURNOVER_LACS"] / 100,
+        "Delivery %": df.get("DELIV_PER"),
+        "Trades": df.get("NO_OF_TRADES"),
+    })
+
+    if not prior.empty and "CLOSE_PRICE" in prior.columns:
+        base = prior[prior.get("SERIES", "EQ") == "EQ"][["SYMBOL", "CLOSE_PRICE"]]
+        base = base.rename(columns={"CLOSE_PRICE": "_base"})
+        out = out.merge(base, left_on="Symbol", right_on="SYMBOL", how="left")
+        out["1M %"] = ((out["Close"] - out["_base"]) / out["_base"]) * 100
+        out = out.drop(columns=["_base", "SYMBOL"], errors="ignore")
+
+    return out.reset_index(drop=True)
+
+
 # =============================================================== DEPTH =======
 # No free public source exists for the bid/ask book. It must come from a
 # broker. Angel One SmartAPI, DhanHQ, Fyers and Shoonya all provide it free
@@ -675,6 +807,42 @@ def load_fno_oi():
     return fetch_fno_participant_oi()
 
 
+@st.cache_data(ttl=86400)
+def load_universe():
+    return fetch_nse_universe()
+
+
+@st.cache_data(ttl=3600)
+def load_market_screen():
+    """Whole-market table plus the date it represents."""
+    latest, latest_date = fetch_latest_bhavcopy()
+    if latest.empty:
+        return pd.DataFrame(), None
+
+    prior = pd.DataFrame()
+    for offset in range(30, 38):
+        day = datetime.now() - timedelta(days=offset)
+        if day.weekday() >= 5:
+            continue
+        prior = _fetch_bhav_for(day)
+        if not prior.empty:
+            break
+
+    screen = build_market_screen(latest, prior)
+
+    universe = load_universe()
+    if not universe.empty and not screen.empty:
+        screen = screen.merge(
+            universe[["Symbol", "Company"]], on="Symbol", how="left"
+        )
+        cols = ["Symbol", "Company"] + [
+            c for c in screen.columns if c not in ("Symbol", "Company")
+        ]
+        screen = screen[cols]
+
+    return screen, latest_date
+
+
 # ============================================================== HELPERS ======
 
 def fmt(value, decimals: int = 2, dash: str = "—") -> str:
@@ -769,8 +937,10 @@ st.markdown(f'<div class="pulse-strip">{"".join(cells)}</div>', unsafe_allow_htm
 
 # ================================================================= TABS ======
 
-tab_market, tab_news, tab_flows, tab_ratios, tab_book, tab_depth = st.tabs(
-    ["Markets", "News", "FII / DII", "Ratios", "Order Book", "Depth"]
+(tab_market, tab_screen, tab_news, tab_flows,
+ tab_ratios, tab_book, tab_depth) = st.tabs(
+    ["Markets", "Screener (all NSE)", "News", "FII / DII",
+     "Ratios", "Order Book", "Depth"]
 )
 
 with tab_market:
@@ -802,6 +972,89 @@ with tab_market:
             st.dataframe(
                 colour_frame(global_df.drop(columns=["Symbol"]), ["Change %"]),
                 use_container_width=True, height=520, hide_index=True,
+            )
+
+
+with tab_screen:
+    st.markdown("#### Whole-market screener")
+    st.caption(
+        "Every EQ-series stock on NSE, from the daily bhavcopy — one file, one "
+        "request. Screen here on price and volume, then send a shortlist to the "
+        "Ratios tab for fundamentals."
+    )
+
+    with st.spinner("Loading full market…"):
+        screen, screen_date = load_market_screen()
+
+    if screen.empty:
+        st.markdown(
+            '<div class="stale">NSE did not return the bhavcopy. The file publishes '
+            'after market close on trading days, and NSE refuses cloud-host requests '
+            'intermittently. Try Refresh, or check back after 7pm IST.</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.caption(f"{len(screen):,} stocks · trading day {screen_date}")
+
+        f1, f2, f3, f4 = st.columns(4)
+        min_turnover = f1.number_input("Min turnover (Cr)", value=5.0, step=1.0)
+        min_delivery = f2.number_input("Min delivery %", value=0.0, step=5.0)
+        min_price = f3.number_input("Min price", value=0.0, step=10.0)
+        max_price = f4.number_input("Max price (0 = no cap)", value=0.0, step=100.0)
+
+        g1, g2 = st.columns(2)
+        move_min = g1.number_input("Min day % move", value=-100.0, step=1.0)
+        move_max = g2.number_input("Max day % move", value=100.0, step=1.0)
+
+        view = screen.copy()
+        view = view[view["Turnover (Cr)"].fillna(0) >= min_turnover]
+        if min_delivery > 0 and "Delivery %" in view.columns:
+            view = view[view["Delivery %"].fillna(0) >= min_delivery]
+        if min_price > 0:
+            view = view[view["Close"].fillna(0) >= min_price]
+        if max_price > 0:
+            view = view[view["Close"].fillna(1e12) <= max_price]
+        view = view[view["Day %"].between(move_min, move_max, inclusive="both")]
+
+        sort_options = [c for c in ["Turnover (Cr)", "Day %", "1M %", "Delivery %",
+                                    "Volume", "Close"] if c in view.columns]
+        s1, s2 = st.columns([3, 1])
+        sort_by = s1.selectbox("Sort by", options=sort_options)
+        descending = s2.checkbox("Descending", value=True)
+        view = view.sort_values(sort_by, ascending=not descending, na_position="last")
+
+        st.caption(f"{len(view):,} stocks pass the filters.")
+        st.dataframe(
+            colour_frame(view.head(500), ["Day %", "1M %"]),
+            use_container_width=True, height=520, hide_index=True,
+        )
+        if len(view) > 500:
+            st.caption("Showing the top 500. Tighten the filters to narrow further.")
+
+        st.download_button(
+            "Download these results as CSV",
+            data=view.to_csv(index=False).encode("utf-8"),
+            file_name=f"nse_screen_{screen_date}.csv",
+            mime="text/csv",
+        )
+
+        st.divider()
+        st.markdown("**Send a shortlist to the Ratios tab**")
+        st.caption(
+            "Fundamentals are fetched company by company, roughly 4 seconds each, "
+            "so this is capped at 40. Screen down first, then drill in."
+        )
+
+        shortlist = st.multiselect(
+            "Pick up to 40 symbols",
+            options=view["Symbol"].head(500).tolist(),
+            max_selections=40,
+        )
+        if shortlist:
+            st.session_state["shortlist"] = [f"{s}.NS" for s in shortlist]
+            st.success(
+                f"{len(shortlist)} symbols queued. Open the Ratios tab and switch "
+                "the source to 'Screener shortlist'."
             )
 
 
@@ -879,12 +1132,44 @@ with tab_flows:
 
 
 with tab_ratios:
-    st.markdown("#### Fundamentals screener")
+    st.markdown("#### Fundamentals")
     st.caption("Cached six hours — the source is rate-limited, so repeated refreshes "
                "will get you throttled.")
 
-    with st.spinner("Pulling fundamentals…"):
-        ratios = load_ratios(tickers)
+    shortlist = st.session_state.get("shortlist", [])
+    source = st.radio(
+        "Source",
+        options=["Watchlist", "Screener shortlist"],
+        horizontal=True,
+        index=0,
+        help="Build a shortlist on the Screener tab to analyse screened names.",
+    )
+
+    if source == "Screener shortlist":
+        if not shortlist:
+            st.info("No shortlist yet. Pick symbols on the Screener tab first.")
+            target = ()
+        else:
+            target = tuple(shortlist)
+            st.caption(f"{len(target)} symbols from your screen.")
+    else:
+        target = tickers
+
+    ratios = pd.DataFrame()
+    if target:
+        cache_key = str(sorted(target))
+        if st.session_state.get("_ratio_key") != cache_key:
+            bar = st.progress(0.0, text="Pulling fundamentals…")
+            rows = []
+            for i, t in enumerate(target):
+                rows.append(fetch_ratios([t]))
+                bar.progress((i + 1) / len(target), text=f"Fetched {i + 1} of {len(target)}")
+            bar.empty()
+            ratios = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+            st.session_state["_ratio_key"] = cache_key
+            st.session_state["_ratio_data"] = ratios
+        else:
+            ratios = st.session_state.get("_ratio_data", pd.DataFrame())
 
     if ratios.empty:
         st.info("No fundamental data returned.")
