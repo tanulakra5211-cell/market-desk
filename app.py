@@ -1669,6 +1669,79 @@ def add_implied_vols(chain: pd.DataFrame, as_of) -> pd.DataFrame:
     return out
 
 
+# ================================================================ GREEKS =====
+# Sensitivities from the same Black-Scholes model used for implied volatility.
+# Theta is the one option buyers underestimate: it is reported per calendar
+# day here, because that is how it is actually felt.
+
+def _norm_pdf(x):
+    import math
+    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
+
+def greeks(spot, strike, t_years, vol, rate=0.065, is_call=True):
+    """vol as a decimal (0.15 = 15%). Returns delta, gamma, theta/day, vega/1%."""
+    import math
+    if t_years <= 0 or vol <= 0 or spot <= 0 or strike <= 0:
+        return {"delta": float("nan"), "gamma": float("nan"),
+                "theta": float("nan"), "vega": float("nan")}
+
+    sqrt_t = math.sqrt(t_years)
+    d1 = (math.log(spot / strike) + (rate + 0.5 * vol * vol) * t_years) / (vol * sqrt_t)
+    d2 = d1 - vol * sqrt_t
+    disc = math.exp(-rate * t_years)
+    pdf = _norm_pdf(d1)
+
+    delta = _norm_cdf(d1) if is_call else _norm_cdf(d1) - 1.0
+    gamma = pdf / (spot * vol * sqrt_t)
+    vega = spot * pdf * sqrt_t / 100.0          # per 1 volatility point
+
+    theta_year = -(spot * pdf * vol) / (2 * sqrt_t)
+    if is_call:
+        theta_year -= rate * strike * disc * _norm_cdf(d2)
+    else:
+        theta_year += rate * strike * disc * _norm_cdf(-d2)
+
+    return {"delta": delta, "gamma": gamma,
+            "theta": theta_year / 365.0, "vega": vega}
+
+
+def scenario_table(spot, strike, premium, expiry_days, hold_days, vol_pct,
+                   is_call, direction, qty, atr_pct, iv_shift=0.0):
+    """
+    What the option is worth at a range of prices, after `hold_days`.
+
+    The scenarios come from the underlying's own realised volatility (ATR
+    scaled by root-time), so the spread is calibrated to how much this stock
+    actually moves rather than to round numbers.
+    """
+    import numpy as np
+    move = atr_pct / 100.0 * spot * (hold_days ** 0.5)
+    if move <= 0 or not np.isfinite(move):
+        move = spot * 0.03
+
+    t_left = max((expiry_days - hold_days), 0) / 365.0
+    vol = max((vol_pct + iv_shift), 0.1) / 100.0
+    sign = 1 if direction == "long" else -1
+
+    rows = []
+    for mult, label in [(-2, "Sharp fall"), (-1, "Fall"), (-0.5, "Drift down"),
+                        (0, "Unchanged"), (0.5, "Drift up"), (1, "Rise"),
+                        (2, "Sharp rise")]:
+        s = max(spot + mult * move, 0.01)
+        value = bs_price(s, strike, t_left, vol, is_call=is_call)
+        pnl = sign * (value - premium) * qty
+        rows.append({
+            "Scenario": label,
+            "Underlying": s,
+            "Move %": ((s - spot) / spot) * 100,
+            "Option value": value,
+            "P&L": pnl,
+            "Return %": (pnl / (premium * qty)) * 100 if premium else float("nan"),
+        })
+    return pd.DataFrame(rows)
+
+
 # =============================================================== OPTIONS =====
 # Payoff maths for arbitrary multi-leg positions. Everything here is exact
 # arithmetic on expiry values -- no model, no assumptions, no forecast. What
@@ -2797,11 +2870,152 @@ with tab_tech, safe_tab("Technicals"):
 with tab_opt, safe_tab("Options"):
     st.markdown("#### Options")
 
-    opt_view = st.radio("View", ["Payoff calculator", "Option chain", "IV rank"],
-                        horizontal=True, key="opt_view")
+    opt_view = st.radio(
+        "View",
+        ["Scenario calculator", "Payoff calculator", "Option chain", "IV rank"],
+        horizontal=True, key="opt_view")
+
+    # -------------------------------------------------- scenario calculator ---
+    if opt_view == "Scenario calculator":
+        st.caption(
+            "Reads the chart, then prices the option across a range of outcomes "
+            "sized by that stock's own volatility. It answers *if this happens, "
+            "what is it worth* — not *what will happen*."
+        )
+
+        univ = symbol_universe()
+        opts_list = ([f"{s}.NS" for s in sorted(univ["Symbol"])]
+                     if not univ.empty else list(tickers))
+        watch_first = [t for t in tickers if t in opts_list]
+        opts_list = watch_first + [t for t in opts_list if t not in watch_first]
+
+        if not opts_list:
+            st.info("No symbols available. Check the Screener tab.")
+        else:
+            sc_pick = st.selectbox("Underlying", opts_list, key="sc_pick",
+                                   format_func=lambda t: name_by_ticker.get(
+                                       t, t.replace(".NS", "")))
+            with st.spinner("Reading the chart…"):
+                ca = load_chart_analysis(sc_pick)
+
+            if ca is None:
+                st.info("Not enough price history for this symbol.")
+            else:
+                pats = detect_patterns(ca["ohlc"])
+                verdict = chart_verdict(pats, ca)
+                colour = {"up": "#2fbf71", "down": "#e5484d",
+                          "flat": "#6b7684"}[verdict["tone"]]
+
+                st.markdown(
+                    f'<div style="border-left:3px solid {colour};padding:0.7rem 1rem;'
+                    f'background:#141a21;margin:0.4rem 0;">'
+                    f'<div style="font-size:1.1rem;font-weight:650;color:{colour};">'
+                    f'Chart reads: {verdict["stance"]}</div>'
+                    f'<div style="color:#8b95a1;font-size:0.85rem;">'
+                    f'Spot Rs {ca["last"]:,.2f} · RSI {ca["rsi"]:.0f} · '
+                    f'typical daily move {ca["atr_pct"]:.1f}% · '
+                    f'{verdict["bull"]} bullish vs {verdict["bear"]} bearish signals'
+                    f'</div></div>', unsafe_allow_html=True)
+
+                suggested = "call" if verdict["tone"] == "up" else (
+                    "put" if verdict["tone"] == "down" else "call")
+
+                st.markdown("**Your option**")
+                o1, o2, o3, o4 = st.columns(4)
+                o_dir = o1.selectbox("Direction", ["long", "short"], key="sc_dir")
+                o_kind = o2.selectbox("Type", ["call", "put"],
+                                      index=0 if suggested == "call" else 1,
+                                      key="sc_kind",
+                                      help="Pre-set from the chart read — override freely.")
+                o_strike = o3.number_input("Strike", value=float(round(ca["last"], -1)),
+                                           step=50.0, key="sc_strike")
+                o_prem = o4.number_input("Premium paid/received", value=100.0,
+                                         step=5.0, key="sc_prem")
+
+                p1, p2, p3 = st.columns(3)
+                days_exp = p1.number_input("Days to expiry", value=30, min_value=1,
+                                           step=1, key="sc_exp")
+                hold = p2.number_input("Days you'll hold", value=10, min_value=0,
+                                       step=1, key="sc_hold",
+                                       help="Scenario is priced this many days from now.")
+                lots = p3.number_input("Lots", value=1, min_value=1, step=1, key="sc_lots")
+
+                base = sc_pick.replace(".NS", "")
+                lot_size = load_lot_sizes().get(base, LOT_SIZES.get(base, 1))
+                qty = int(lots) * int(lot_size)
+
+                solved_iv = implied_vol(o_prem, ca["last"], o_strike,
+                                        days_exp / 365.0,
+                                        is_call=(o_kind == "call"))
+                iv_default = solved_iv if solved_iv == solved_iv else 25.0
+
+                v1, v2 = st.columns(2)
+                iv_use = v1.number_input(
+                    "Implied volatility %", value=float(round(iv_default, 1)),
+                    step=1.0, key="sc_iv",
+                    help="Solved from your premium where possible.")
+                iv_shift = v2.number_input(
+                    "IV change in the scenario", value=0.0, step=1.0, key="sc_ivsh",
+                    help="Volatility usually rises when price falls. Try -5 for a "
+                         "post-event crush.")
+
+                if solved_iv == solved_iv:
+                    st.caption(f"Your premium of Rs {o_prem:,.2f} implies "
+                               f"{solved_iv:.1f}% volatility at that strike. "
+                               f"Lot size {lot_size}, so {qty:,} units.")
+                else:
+                    st.caption(
+                        "That premium has no Black-Scholes solution — usually it is "
+                        "below intrinsic value, or the expiry is too near. The "
+                        "default volatility is being used instead."
+                    )
+
+                tbl = scenario_table(
+                    ca["last"], o_strike, o_prem, days_exp, hold, iv_use,
+                    o_kind == "call", o_dir, qty, ca["atr_pct"], iv_shift)
+
+                st.markdown("**If this happens, this is what you have**")
+                st.dataframe(
+                    colour_frame(tbl, ["Move %", "P&L", "Return %"]),
+                    use_container_width=True, hide_index=True)
+
+                g = greeks(ca["last"], o_strike, days_exp / 365.0, iv_use / 100.0,
+                           is_call=(o_kind == "call"))
+                sign = 1 if o_dir == "long" else -1
+                g1, g2, g3, g4 = st.columns(4)
+                g1.metric("Delta", f"{g['delta'] * sign:+.3f}",
+                          help="Change in option value per 1 rupee of underlying.")
+                g2.metric("Theta / day", f"Rs {g['theta'] * sign * qty:,.0f}",
+                          help="Value lost to time each day, whole position.")
+                g3.metric("Vega / 1% IV", f"Rs {g['vega'] * sign * qty:,.0f}")
+                g4.metric("Gamma", f"{g['gamma'] * sign:.5f}")
+
+                theta_total = g["theta"] * sign * qty * hold
+                if o_dir == "long" and theta_total < 0:
+                    cost = abs(theta_total)
+                    st.markdown(
+                        f'<div class="stale"><b>Time decay over {int(hold)} days: '
+                        f'Rs {cost:,.0f}.</b> That is what the position loses if the '
+                        f'underlying does not move at all. Against a premium of '
+                        f'Rs {o_prem * qty:,.0f}, decay alone is '
+                        f'{cost / (o_prem * qty) * 100:.0f}% of what you paid. '
+                        f'Being right on direction but slow is how most long option '
+                        f'positions lose.</div>', unsafe_allow_html=True)
+
+                st.markdown(
+                    '<div class="stale"><b>What this does and does not do.</b> The '
+                    'scenarios are sized by this stock\'s realised volatility, so '
+                    'the spread is calibrated to how much it actually moves — but '
+                    'they carry no probabilities, and the chart stance is a tally '
+                    'of patterns whose predictive power is weak. Repricing also '
+                    'holds implied volatility fixed unless you shift it, which is '
+                    'wrong in the direction that hurts buyers: IV typically rises '
+                    'when price falls and collapses after events. Use the IV change '
+                    'box to test that rather than assuming it away.</div>',
+                    unsafe_allow_html=True)
 
     # ------------------------------------------------------------ payoff ---
-    if opt_view == "Payoff calculator":
+    elif opt_view == "Payoff calculator":
         st.caption(
             "Exact arithmetic on expiry values — no model and no assumptions. "
             "It tells you what each outcome pays, not how likely any of them is."
