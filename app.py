@@ -1073,6 +1073,9 @@ def load_stored_history() -> pd.DataFrame:
 
     df = pd.concat(frames, ignore_index=True)
     df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
+    for c in df.columns:
+        if pd.api.types.is_float_dtype(df[c]):
+            df[c] = df[c].astype("float32")
     return df.dropna(subset=["DATE"]).sort_values(["DATE", "SYMBOL"])
 
 
@@ -1471,11 +1474,17 @@ def scan_market_patterns(hist: pd.DataFrame) -> pd.DataFrame:
     if hist.empty:
         return pd.DataFrame()
 
+    # Only the last year matters for these patterns, and float32 halves the
+    # memory. Without both, the pivots below exhaust a 1GB container.
+    keep_dates = sorted(hist["DATE"].unique())[-260:]
+    hist = hist[hist["DATE"].isin(keep_dates)]
+
     def wide(col):
         if col not in hist.columns:
             return None
-        return hist.pivot_table(index="DATE", columns="SYMBOL",
-                                values=col, aggfunc="last").sort_index()
+        m = hist.pivot_table(index="DATE", columns="SYMBOL",
+                             values=col, aggfunc="last").sort_index()
+        return m.astype("float32")
 
     C, O, H, L, V = (wide(x) for x in ["CLOSE", "OPEN", "HIGH", "LOW", "VOLUME"])
     if C is None or len(C) < 60:
@@ -2081,14 +2090,21 @@ with tab_tech, safe_tab("Technicals"):
         "history — instant, because it reads from disk rather than NSE."
     )
 
-    scan_hist = cached_history()
-    if scan_hist.empty:
+    if not HISTORY_DIR.exists() or not any(HISTORY_DIR.glob("*.csv.gz")):
         st.info(
             "Needs stored history. Run the collector from the Actions tab "
             "in GitHub first — see the Backtest tab."
         )
+    elif not st.session_state.get("_run_scan"):
+        if st.button("Run pattern scan", type="primary", key="scan_go"):
+            st.session_state["_run_scan"] = True
+            st.rerun()
+        st.caption(
+            "Runs on demand rather than automatically — scanning the whole "
+            "market is memory-heavy and would otherwise run on every click."
+        )
     else:
-        with st.spinner("Scanning…"):
+        with st.spinner("Scanning the whole market…"):
             scan = cached_pattern_scan()
 
         if scan.empty:
