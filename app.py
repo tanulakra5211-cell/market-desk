@@ -461,7 +461,10 @@ def _archive_get(url: str):
             return None, f"HTTP {resp.status_code}"
         if len(resp.content) < 200:
             return None, f"empty response ({len(resp.content)} bytes)"
-        return resp, "ok"
+        head = resp.content[:300].lstrip().lower()
+        if head.startswith(b"<!doctype") or head.startswith(b"<html"):
+            return None, f"HTML page, not data ({len(resp.content)} bytes)"
+        return resp, f"ok ({len(resp.content) // 1024} KB)"
     except Exception as exc:  # noqa: BLE001
         return None, f"{type(exc).__name__}: {exc}"
 
@@ -571,16 +574,42 @@ def fetch_latest_bhavcopy(max_lookback: int = 7):
     return pd.DataFrame(), None, attempts
 
 
-def build_market_screen(latest: pd.DataFrame, prior: pd.DataFrame) -> pd.DataFrame:
+def build_market_screen(latest: pd.DataFrame, prior: pd.DataFrame,
+                       attempts: list | None = None) -> pd.DataFrame:
     """
     Whole-market screening table. Day change comes from the file's own
     PREV_CLOSE; the 1M column is computed against an older bhavcopy if one
     was retrieved.
+
+    Each stage records its row count in `attempts` so a silent drop to zero
+    is visible rather than mysterious.
     """
+    def log(stage, detail):
+        if attempts is not None:
+            attempts.append(("build", stage, str(detail)))
+
     if latest.empty:
+        log("input", "empty frame")
         return pd.DataFrame()
 
-    df = latest[latest.get("SERIES", "EQ") == "EQ"].copy()
+    log("rows received", len(latest))
+    log("columns", ", ".join(list(latest.columns)[:14]))
+
+    if "SERIES" in latest.columns:
+        series_vals = latest["SERIES"].astype(str).str.strip().str.upper()
+        log("series found", ", ".join(sorted(series_vals.unique())[:12]))
+        df = latest[series_vals == "EQ"].copy()
+    else:
+        log("series column", "absent - keeping all rows")
+        df = latest.copy()
+
+    log("rows after EQ filter", len(df))
+
+    required = ["SYMBOL", "CLOSE_PRICE", "PREV_CLOSE", "TTL_TRD_QNTY", "TURNOVER_LACS"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        log("MISSING COLUMNS", ", ".join(missing))
+        return pd.DataFrame()
 
     out = pd.DataFrame({
         "Symbol": df["SYMBOL"],
@@ -591,6 +620,7 @@ def build_market_screen(latest: pd.DataFrame, prior: pd.DataFrame) -> pd.DataFra
         "Delivery %": df.get("DELIV_PER"),
         "Trades": df.get("NO_OF_TRADES"),
     })
+    log("rows built", len(out))
 
     if not prior.empty and "CLOSE_PRICE" in prior.columns:
         base = prior[prior.get("SERIES", "EQ") == "EQ"][["SYMBOL", "CLOSE_PRICE"]]
@@ -599,6 +629,7 @@ def build_market_screen(latest: pd.DataFrame, prior: pd.DataFrame) -> pd.DataFra
         out["1M %"] = ((out["Close"] - out["_base"]) / out["_base"]) * 100
         out = out.drop(columns=["_base", "SYMBOL"], errors="ignore")
 
+    log("rows returned", len(out))
     return out.reset_index(drop=True)
 
 
@@ -885,9 +916,10 @@ def load_market_screen():
         if not prior.empty:
             break
 
-    screen = build_market_screen(latest, prior)
+    screen = build_market_screen(latest, prior, attempts)
 
     universe = load_universe()
+    attempts.append(("build", "universe rows", str(len(universe))))
     if not universe.empty and not screen.empty:
         screen = screen.merge(
             universe[["Symbol", "Company"]], on="Symbol", how="left"
@@ -897,6 +929,7 @@ def load_market_screen():
         ]
         screen = screen[cols]
 
+    attempts.append(("build", "final rows", str(len(screen))))
     return screen, latest_date, attempts
 
 
@@ -1065,6 +1098,9 @@ with tab_screen:
                 st.write("No attempts recorded.")
     else:
         st.caption(f"{len(screen):,} stocks · trading day {screen_date}")
+        with st.expander("Fetch log"):
+            st.dataframe(pd.DataFrame(attempts, columns=["Date", "File", "Result"]),
+                         use_container_width=True, hide_index=True)
 
         f1, f2, f3, f4 = st.columns(4)
         min_turnover = f1.number_input("Min turnover (Cr)", value=5.0, step=1.0)
