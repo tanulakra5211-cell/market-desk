@@ -1590,6 +1590,85 @@ def scan_market_patterns(hist: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+# ============================================ IMPLIED VOLATILITY (BSM) =======
+# The F&O bhavcopy carries prices and open interest but no implied volatility,
+# so it is solved from the closing price. Bisection rather than Newton: slower,
+# but it cannot diverge on the deep-ITM and near-expiry contracts where Newton
+# routinely blows up.
+
+def _norm_cdf(x):
+    import math
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def bs_price(spot, strike, t_years, vol, rate=0.065, is_call=True):
+    """Black-Scholes-Merton price. No dividend yield -- Indian options are on
+    futures-style underlyings often enough that adding one would be guesswork."""
+    import math
+    if t_years <= 0 or vol <= 0 or spot <= 0 or strike <= 0:
+        intrinsic = (spot - strike) if is_call else (strike - spot)
+        return max(intrinsic, 0.0)
+
+    d1 = (math.log(spot / strike) + (rate + 0.5 * vol * vol) * t_years) / (vol * math.sqrt(t_years))
+    d2 = d1 - vol * math.sqrt(t_years)
+    disc = math.exp(-rate * t_years)
+    if is_call:
+        return spot * _norm_cdf(d1) - strike * disc * _norm_cdf(d2)
+    return strike * disc * _norm_cdf(-d2) - spot * _norm_cdf(-d1)
+
+
+def implied_vol(price, spot, strike, t_years, rate=0.065, is_call=True):
+    """
+    Solve for the volatility that reproduces the observed price.
+
+    Returns NaN where no solution exists — a price below intrinsic value, a
+    contract that did not trade, or an expiry too close to be meaningful.
+    Returning a number there would be inventing one.
+    """
+    if not all(map(lambda v: v == v, [price, spot, strike, t_years])):
+        return float("nan")
+    if price <= 0 or spot <= 0 or strike <= 0 or t_years <= 1 / 365:
+        return float("nan")
+
+    intrinsic = max((spot - strike) if is_call else (strike - spot), 0.0)
+    if price < intrinsic - 1e-6:
+        return float("nan")          # price below intrinsic: stale or bad print
+
+    lo, hi = 1e-4, 5.0
+    if bs_price(spot, strike, t_years, hi, rate, is_call) < price:
+        return float("nan")          # beyond 500% vol: not a real quote
+
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        if bs_price(spot, strike, t_years, mid, rate, is_call) < price:
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo < 1e-6:
+            break
+    vol = 0.5 * (lo + hi)
+    return vol * 100 if 0.001 < vol < 4.99 else float("nan")
+
+
+def add_implied_vols(chain: pd.DataFrame, as_of) -> pd.DataFrame:
+    """Attach an IV column to an F&O chain slice."""
+    if chain.empty:
+        return chain
+    out = chain.copy()
+    ref = pd.Timestamp(as_of)
+    exp = pd.to_datetime(out["EXPIRY"], errors="coerce")
+    t = (exp - ref).dt.days.clip(lower=0) / 365.0
+
+    ivs = []
+    for price, spot, strike, tt, opt in zip(
+            out["CLOSE"], out["UNDERLYING"], out["STRIKE"], t, out["OPT"]):
+        ivs.append(implied_vol(price, spot, strike, tt,
+                               is_call=str(opt).upper().startswith("C")))
+    out["IV %"] = ivs
+    out["Days to expiry"] = (exp - ref).dt.days
+    return out
+
+
 # =============================================================== OPTIONS =====
 # Payoff maths for arbitrary multi-leg positions. Everything here is exact
 # arithmetic on expiry values -- no model, no assumptions, no forecast. What
@@ -1905,6 +1984,38 @@ def load_iv_history() -> pd.DataFrame:
         return df.dropna(subset=["DATE"]).sort_values("DATE")
     except Exception:
         return pd.DataFrame()
+
+
+FNO_DIR = Path(__file__).parent / "data" / "fno"
+LOTS_PATH = Path(__file__).parent / "data" / "lot_sizes.csv"
+
+
+@st.cache_data(ttl=1800)
+def load_fno_latest() -> pd.DataFrame:
+    """Newest stored F&O bhavcopy — every underlying, strike and expiry."""
+    if not FNO_DIR.exists():
+        return pd.DataFrame()
+    files = sorted(FNO_DIR.glob("*.csv.gz"))
+    if not files:
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(files[-1], skipinitialspace=True)
+        return df[df["DATE"] == df["DATE"].max()].copy()
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=86400)
+def load_lot_sizes() -> dict:
+    """Exchange lot sizes if collected, else the small built-in fallback."""
+    if LOTS_PATH.exists():
+        try:
+            df = pd.read_csv(LOTS_PATH, skipinitialspace=True)
+            return {str(r["SYMBOL"]): int(r["LOT_SIZE"])
+                    for _, r in df.iterrows() if pd.notna(r["LOT_SIZE"])}
+        except Exception:
+            pass
+    return dict(LOT_SIZES)
 
 
 @st.cache_data(ttl=1800)
@@ -2787,61 +2898,89 @@ with tab_opt, safe_tab("Options"):
 
     # ------------------------------------------------------------- chain ---
     elif opt_view == "Option chain":
-        chain = load_latest_chain()
-        if chain.empty:
-            st.info(
-                "No chain data stored yet. The GitHub Action collects it — run "
-                "*Collect bhavcopy* once and it will snapshot every tracked "
-                "underlying, then keep doing so each weekday."
+        fno = load_fno_latest()
+
+        if not fno.empty:
+            opts = fno[fno["OPT"].isin(["CE", "PE"])] if "OPT" in fno.columns else fno
+            unders = sorted(opts["SYMBOL"].dropna().unique())
+            snap_date = fno["DATE"].iloc[0]
+
+            st.caption(
+                f"{len(unders)} F&O underlyings · {len(opts):,} option contracts · "
+                f"snapshot {snap_date}. NSE permits derivatives on roughly 190 "
+                "stocks, not the whole cash market — that is exchange eligibility, "
+                "not a gap in this data."
             )
-        else:
-            syms = sorted(chain["SYMBOL"].unique())
+
             c1, c2 = st.columns(2)
-            sym = c1.selectbox("Underlying", syms, key="chain_sym")
-            sub = chain[chain["SYMBOL"] == sym]
-            exps = list(pd.to_datetime(sub["EXPIRY"], format="%d-%b-%Y",
-                                       errors="coerce").dropna().sort_values()
-                        .dt.strftime("%d-%b-%Y").unique())
-            exp = c2.selectbox("Expiry", exps, key="chain_exp")
+            sym = c1.selectbox("Underlying", unders, key="fno_sym")
+            sub = opts[opts["SYMBOL"] == sym].copy()
+            exps = sorted(pd.to_datetime(sub["EXPIRY"], errors="coerce").dropna().unique())
+            exp_labels = [pd.Timestamp(e).strftime("%d-%b-%Y") for e in exps]
+            exp_pick = c2.selectbox("Expiry", exp_labels, key="fno_exp")
+            chosen = exps[exp_labels.index(exp_pick)]
 
-            view = sub[sub["EXPIRY"] == exp].copy()
-            spot_val = pd.to_numeric(view["UNDERLYING"], errors="coerce").iloc[0]
-            for c in view.columns:
-                if c not in ("SYMBOL", "EXPIRY", "DATE"):
-                    view[c] = pd.to_numeric(view[c], errors="coerce")
+            view = sub[pd.to_datetime(sub["EXPIRY"], errors="coerce") == chosen].copy()
+            sv = pd.to_numeric(view["UNDERLYING"], errors="coerce").dropna()
+            spot_val = float(sv.iloc[0]) if len(sv) else float("nan")
 
-            st.caption(f"Spot {spot_val:,.2f} · snapshot dated {sub['DATE'].iloc[0]}")
+            with st.spinner("Solving implied volatility…"):
+                view = add_implied_vols(view, snap_date)
 
-            view["CE view"] = [classify_oi(p, o) for p, o
-                               in zip(view["CE_CHG"], view["CE_CHG_OI"])]
-            view["PE view"] = [classify_oi(p, o) for p, o
-                               in zip(view["PE_CHG"], view["PE_CHG_OI"])]
+            ce = view[view["OPT"] == "CE"].set_index("STRIKE")
+            pe = view[view["OPT"] == "PE"].set_index("STRIKE")
+            merged = pd.DataFrame({"STRIKE": sorted(set(ce.index) | set(pe.index))})
+            for pfx, frame in (("CE", ce), ("PE", pe)):
+                for col, out in [("OI","OI"),("CHG_OI","CHG_OI"),("IV %","IV"),
+                                 ("CLOSE","LTP"),("VOLUME","VOL"),("PREV_CLOSE","PREV")]:
+                    if col in frame.columns:
+                        merged[f"{pfx}_{out}"] = frame[col].reindex(merged["STRIKE"]).values
+                if f"{pfx}_LTP" in merged and f"{pfx}_PREV" in merged:
+                    chg = merged[f"{pfx}_LTP"] - merged[f"{pfx}_PREV"]
+                    merged[f"{pfx} view"] = [classify_oi(p, o) for p, o in
+                                             zip(chg, merged.get(f"{pfx}_CHG_OI", chg * 0))]
 
-            near = view.iloc[(view["STRIKE"] - spot_val).abs().argsort()[:21]]
-            near = near.sort_values("STRIKE")
+            lots = load_lot_sizes()
+            st.caption(f"Spot {spot_val:,.2f} · lot size {lots.get(sym, '—')} · "
+                       "IV solved from closing prices via Black-Scholes")
 
-            cols = ["CE_OI", "CE_CHG_OI", "CE_IV", "CE_LTP", "CE view", "STRIKE",
-                    "PE view", "PE_LTP", "PE_IV", "PE_CHG_OI", "PE_OI"]
-            st.dataframe(near[[c for c in cols if c in near.columns]],
+            if spot_val == spot_val:
+                near = merged.iloc[(merged["STRIKE"] - spot_val).abs()
+                                   .argsort()[:21]].sort_values("STRIKE")
+            else:
+                near = merged.head(21)
+
+            order = ["CE_OI","CE_CHG_OI","CE_IV","CE_LTP","CE view","STRIKE",
+                     "PE view","PE_LTP","PE_IV","PE_CHG_OI","PE_OI"]
+            st.dataframe(near[[c for c in order if c in near.columns]]
+                         .style.format(precision=2, na_rep="—"),
                          use_container_width=True, height=520, hide_index=True)
 
-            ce_oi, pe_oi = view["CE_OI"].sum(), view["PE_OI"].sum()
+            ce_oi = float(merged["CE_OI"].sum()) if "CE_OI" in merged else 0.0
+            pe_oi = float(merged["PE_OI"].sum()) if "PE_OI" in merged else 0.0
             k1, k2, k3 = st.columns(3)
             k1.metric("PCR (OI)", f"{pe_oi / ce_oi:.2f}" if ce_oi else "—")
-            k2.metric("Max call OI",
-                      f"{view.loc[view['CE_OI'].idxmax(), 'STRIKE']:,.0f}"
-                      if view["CE_OI"].notna().any() else "—")
-            k3.metric("Max put OI",
-                      f"{view.loc[view['PE_OI'].idxmax(), 'STRIKE']:,.0f}"
-                      if view["PE_OI"].notna().any() else "—")
+            if ce_oi:
+                k2.metric("Max call OI",
+                          f"{merged.loc[merged['CE_OI'].idxmax(), 'STRIKE']:,.0f}")
+            if pe_oi:
+                k3.metric("Max put OI",
+                          f"{merged.loc[merged['PE_OI'].idxmax(), 'STRIKE']:,.0f}")
 
             st.markdown(
                 '<div class="stale">Open interest tells you what positions exist, '
-                'not who is right. The strike with the most call OI is routinely '
-                'described as resistance — it is equally consistent with writers '
-                'who will be run over. And this is an end-of-day snapshot: '
-                'intraday OI shifts are invisible here.</div>',
+                'not who is right. The strike with the most call OI gets called '
+                'resistance — it is equally consistent with writers about to be run '
+                'over. This is end-of-day, so intraday shifts are invisible, and '
+                'the IV column is solved from closing prices, which are unreliable '
+                'on contracts that barely traded.</div>',
                 unsafe_allow_html=True,
+            )
+        else:
+            st.info(
+                "No F&O data stored yet. Run the *Collect bhavcopy* workflow — it "
+                "now pulls the entire F&O bhavcopy in a single request, covering "
+                "every underlying NSE permits options on."
             )
 
     # ---------------------------------------------------------- IV rank ----
