@@ -937,6 +937,112 @@ def market_breadth(screen: pd.DataFrame) -> dict:
     }
 
 
+# ================================================ WHOLE-MARKET TECHNICALS ====
+# yfinance cannot do 2,000 companies -- it fetches one at a time. But a stack
+# of bhavcopies gives the entire market's price history in N requests, and
+# every indicator is then a vectorised pandas operation across the whole matrix.
+
+def fetch_bhav_history(calendar_days: int = 120, progress=None) -> pd.DataFrame:
+    """
+    Stack N days of bhavcopy into one long frame:
+    SYMBOL, TRADE_DATE, CLOSE_PRICE, TTL_TRD_QNTY, DELIV_PER, TURNOVER_LACS.
+    """
+    frames, checked = [], 0
+    for offset in range(calendar_days):
+        day = datetime.now() - timedelta(days=offset)
+        if day.weekday() >= 5:
+            continue
+        checked += 1
+        if progress:
+            progress(offset / calendar_days, f"{day:%d %b} — {len(frames)} days loaded")
+        df = _fetch_bhav_for(day)
+        if df.empty:
+            continue
+
+        if "SERIES" in df.columns:
+            df = df[df["SERIES"].astype(str).str.strip().str.upper() == "EQ"]
+        keep = [c for c in ["SYMBOL", "CLOSE_PRICE", "TTL_TRD_QNTY", "DELIV_PER",
+                            "TURNOVER_LACS", "TRADE_DATE"] if c in df.columns]
+        frames.append(df[keep])
+        time.sleep(0.35)  # stay under NSE's ~3 req/sec limit
+
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def compute_market_technicals(hist: pd.DataFrame) -> pd.DataFrame:
+    """
+    RSI, moving averages, momentum, volume expansion and delivery trend for
+    every stock in the market at once.
+    """
+    if hist.empty:
+        return pd.DataFrame()
+
+    closes = hist.pivot_table(index="TRADE_DATE", columns="SYMBOL",
+                              values="CLOSE_PRICE", aggfunc="last").sort_index()
+    vols = hist.pivot_table(index="TRADE_DATE", columns="SYMBOL",
+                            values="TTL_TRD_QNTY", aggfunc="last").sort_index()
+    deliv = hist.pivot_table(index="TRADE_DATE", columns="SYMBOL",
+                             values="DELIV_PER", aggfunc="last").sort_index()
+
+    n = len(closes)
+    if n < 20:
+        return pd.DataFrame()
+
+    last = closes.iloc[-1]
+
+    # Wilder-style RSI, vectorised across all columns
+    delta = closes.diff()
+    gain = delta.clip(lower=0).rolling(14).mean().iloc[-1]
+    loss = (-delta.clip(upper=0)).rolling(14).mean().iloc[-1]
+    rs = gain / loss.replace(0, float("nan"))
+    rsi = 100 - (100 / (1 + rs))
+    rsi = rsi.where(loss != 0, 100.0)
+
+    def sma(w):
+        return closes.rolling(w).mean().iloc[-1] if n >= w else pd.Series(dtype=float)
+
+    def ret(days):
+        if n <= days:
+            return pd.Series(dtype=float)
+        return ((last - closes.iloc[-days - 1]) / closes.iloc[-days - 1]) * 100
+
+    sma20, sma50, sma200 = sma(20), sma(50), sma(200)
+    avg_vol20 = vols.rolling(20).mean().iloc[-1] if n >= 20 else pd.Series(dtype=float)
+
+    out = pd.DataFrame({
+        "Symbol": last.index,
+        "Close": last.values,
+        "RSI (14)": rsi.reindex(last.index).values,
+        "vs 20DMA %": (((last - sma20) / sma20) * 100).reindex(last.index).values,
+        "vs 50DMA %": (((last - sma50) / sma50) * 100).reindex(last.index).values,
+    })
+
+    if len(sma200):
+        out["vs 200DMA %"] = (((last - sma200) / sma200) * 100).reindex(last.index).values
+    for label, days in [("1M %", 21), ("3M %", 63), ("6M %", 126)]:
+        r = ret(days)
+        if len(r):
+            out[label] = r.reindex(last.index).values
+
+    out["Range position %"] = (
+        ((last - closes.min()) / (closes.max() - closes.min())) * 100
+    ).reindex(last.index).values
+
+    if len(avg_vol20):
+        out["Vol vs 20d"] = (vols.iloc[-1] / avg_vol20).reindex(last.index).values
+
+    if not deliv.empty and n >= 20:
+        recent = deliv.tail(5).mean()
+        base = deliv.tail(20).mean()
+        out["Delivery %"] = recent.reindex(last.index).values
+        out["Delivery trend"] = (recent - base).reindex(last.index).values
+
+    out["Days of history"] = n
+    return out.reset_index(drop=True)
+
+
 # ============================================================== STYLING ======
 
 st.markdown(
@@ -1004,6 +1110,14 @@ def load_flows():
 @st.cache_data(ttl=3600)
 def load_fno_oi():
     return fetch_fno_participant_oi()
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_market_technicals(calendar_days: int):
+    hist = fetch_bhav_history(calendar_days)
+    if hist.empty:
+        return pd.DataFrame(), 0
+    return compute_market_technicals(hist), hist["TRADE_DATE"].nunique()
 
 
 @st.cache_data(ttl=900)
@@ -1143,10 +1257,10 @@ st.markdown(f'<div class="pulse-strip">{"".join(cells)}</div>', unsafe_allow_htm
 
 # ================================================================= TABS ======
 
-(tab_market, tab_screen, tab_tech, tab_news, tab_flows,
+(tab_market, tab_screen, tab_tech, tab_hunt, tab_news, tab_flows,
  tab_ratios, tab_book, tab_depth) = st.tabs(
-    ["Markets", "Screener (all NSE)", "Technicals", "News", "FII / DII",
-     "Ratios", "Order Book", "Depth"]
+    ["Markets", "Screener (all NSE)", "Technicals", "Small-cap hunt", "News",
+     "FII / DII", "Ratios", "Order Book", "Depth"]
 )
 
 with tab_market:
@@ -1308,14 +1422,88 @@ with tab_tech:
         "with RSI at 65 all the way down."
     )
 
-    tech_source = st.radio("Source", ["Watchlist", "Screener shortlist"],
-                           horizontal=True, key="tech_source")
-    tech_target = (tuple(st.session_state.get("shortlist", []))
-                   if tech_source == "Screener shortlist" else tickers)
+    tech_source = st.radio(
+        "Universe",
+        ["All NSE stocks", "Watchlist", "Screener shortlist"],
+        horizontal=True, key="tech_source",
+    )
 
-    if not tech_target:
-        st.info("Nothing selected. Build a shortlist on the Screener tab first.")
+    if tech_source == "All NSE stocks":
+        st.caption(
+            "Computed from stacked bhavcopies — every EQ stock at once. The first "
+            "load takes a few minutes because each trading day is a separate file "
+            "from NSE, then it's cached for six hours."
+        )
+        hist_days = st.select_slider(
+            "History depth",
+            options=[40, 60, 90, 120, 200, 300],
+            value=90,
+            help="Calendar days. 60+ needed for the 50DMA, 300 for the 200DMA.",
+        )
+
+        if st.button("Load whole-market technicals", type="primary"):
+            st.session_state["_mkt_tech_days"] = hist_days
+
+        if st.session_state.get("_mkt_tech_days"):
+            with st.spinner("Fetching bhavcopies and computing indicators…"):
+                mkt_tech, days_loaded = load_market_technicals(
+                    st.session_state["_mkt_tech_days"])
+
+            if mkt_tech.empty:
+                st.warning("No history retrieved. Check the Screener tab's fetch log.")
+            else:
+                universe = load_universe()
+                if not universe.empty:
+                    mkt_tech = mkt_tech.merge(universe[["Symbol", "Company"]],
+                                              on="Symbol", how="left")
+                st.caption(f"{len(mkt_tech):,} stocks · {days_loaded} trading days of history")
+
+                t1, t2, t3 = st.columns(3)
+                rsi_lo = t1.number_input("RSI min", value=0.0, step=5.0)
+                rsi_hi = t2.number_input("RSI max", value=100.0, step=5.0)
+                min_vol_surge = t3.number_input("Min vol vs 20d avg", value=0.0, step=0.5)
+
+                u1, u2 = st.columns(2)
+                above_50 = u1.checkbox("Only above 50DMA")
+                rising_deliv = u2.checkbox("Only rising delivery %")
+
+                v = mkt_tech.copy()
+                v = v[v["RSI (14)"].fillna(-1).between(rsi_lo, rsi_hi)]
+                if min_vol_surge > 0 and "Vol vs 20d" in v.columns:
+                    v = v[v["Vol vs 20d"].fillna(0) >= min_vol_surge]
+                if above_50 and "vs 50DMA %" in v.columns:
+                    v = v[v["vs 50DMA %"].fillna(-1e9) > 0]
+                if rising_deliv and "Delivery trend" in v.columns:
+                    v = v[v["Delivery trend"].fillna(-1e9) > 0]
+
+                sortable = [c for c in v.columns if v[c].dtype.kind in "fi"]
+                sort_col = st.selectbox("Sort by", sortable,
+                                        index=sortable.index("1M %") if "1M %" in sortable else 0)
+                v = v.sort_values(sort_col, ascending=False, na_position="last")
+
+                lead = [c for c in ["Symbol", "Company"] if c in v.columns]
+                v = v[lead + [c for c in v.columns if c not in lead]]
+
+                st.caption(f"{len(v):,} stocks pass.")
+                st.dataframe(
+                    colour_frame(v.head(400), ["vs 20DMA %", "vs 50DMA %", "vs 200DMA %",
+                                               "1M %", "3M %", "6M %", "Delivery trend"]),
+                    use_container_width=True, height=520, hide_index=True,
+                )
+                st.download_button("Download as CSV",
+                                   data=v.to_csv(index=False).encode("utf-8"),
+                                   file_name="nse_technicals.csv", mime="text/csv")
+        else:
+            st.info("Click the button above to load. This runs once, then caches.")
+
+        tech_target = ()
     else:
+        tech_target = (tuple(st.session_state.get("shortlist", []))
+                       if tech_source == "Screener shortlist" else tickers)
+
+    if tech_source != "All NSE stocks" and not tech_target:
+        st.info("Nothing selected. Build a shortlist on the Screener tab first.")
+    elif tech_source != "All NSE stocks":
         with st.spinner("Computing indicators…"):
             tech = load_technicals(tech_target)
 
@@ -1341,6 +1529,120 @@ with tab_tech:
                 "**Vol vs 20d avg** — above 2 means today's volume is double the "
                 "recent norm, which is worth pairing with the delivery % on the "
                 "Screener tab to tell accumulation from churn."
+            )
+
+
+with tab_hunt:
+    st.markdown("#### Small-cap factor screen")
+
+    st.markdown(
+        "Cupid before its run had a specific profile: **ROCE 33.5%, ROE 27.3%, "
+        "debt-to-equity 0.13x**, with revenue and profit compounding at roughly "
+        "**35% and 50%** over three years, in a company small enough that modest "
+        "absolute growth moved the percentages hard."
+    )
+
+    st.markdown(
+        '<div class="stale"><b>Read this before using the output.</b> Hundreds of '
+        'microcaps shared that profile at the same time. Almost none became Cupid; '
+        'a good number went to zero. Screening for the profile returns the whole '
+        'cohort, not the winner — the survivors are only visible in hindsight, which '
+        'is precisely the information this screen does not have. Treat the output as '
+        'a research queue to investigate one by one, not a list of candidates to buy. '
+        'The two things that separated Cupid from its cohort — an export order cycle '
+        'and execution — appear in neither the price data nor the ratios.</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.divider()
+    st.markdown("**Stage 1 — narrow the market on price and volume**")
+    st.caption("Runs off the bhavcopy, so it covers every listed stock at no cost.")
+
+    screen_hunt, hunt_date, _ = load_market_screen()
+
+    if screen_hunt.empty:
+        st.info("Load the Screener tab first — this reuses the same market data.")
+    else:
+        h1, h2, h3 = st.columns(3)
+        px_max = h1.number_input("Max price", value=200.0, step=25.0,
+                                 help="A low price is not a low valuation. This is "
+                                      "only a crude proxy for a small company.")
+        turn_min = h2.number_input("Min turnover (Cr)", value=1.0, step=0.5,
+                                   help="Below ~1 Cr you may not be able to exit.")
+        deliv_min = h3.number_input("Min delivery %", value=40.0, step=5.0,
+                                    help="High delivery means buyers are holding, "
+                                         "not day-trading.")
+
+        cand = screen_hunt.copy()
+        cand = cand[cand["Close"].fillna(1e9) <= px_max]
+        cand = cand[cand["Turnover (Cr)"].fillna(0) >= turn_min]
+        if "Delivery %" in cand.columns:
+            cand = cand[cand["Delivery %"].fillna(0) >= deliv_min]
+
+        st.caption(f"{len(cand):,} stocks pass stage 1.")
+        st.dataframe(
+            colour_frame(cand.sort_values("Turnover (Cr)", ascending=False).head(300),
+                         ["Day %", "1M %"]),
+            use_container_width=True, height=320, hide_index=True,
+        )
+
+        st.divider()
+        st.markdown("**Stage 2 — check fundamentals against the profile**")
+        st.caption(
+            "Fundamentals come one company at a time, so pick up to 30. "
+            "Thresholds default to Cupid's actual figures; loosen them, since "
+            "matching all four exactly will usually return nothing."
+        )
+
+        picks = st.multiselect("Companies to check",
+                               options=cand["Symbol"].head(300).tolist(),
+                               max_selections=30, key="hunt_picks")
+
+        c1, c2, c3, c4 = st.columns(4)
+        min_roce = c1.number_input("Min ROCE %", value=20.0, step=5.0)
+        max_de_h = c2.number_input("Max D/E", value=0.5, step=0.1)
+        min_growth = c3.number_input("Min rev growth %", value=20.0, step=5.0)
+        max_mcap = c4.number_input("Max mkt cap (Cr)", value=5000.0, step=500.0)
+
+        if picks and st.button("Check fundamentals", type="primary", key="hunt_go"):
+            bar = st.progress(0.0, text="Starting…")
+            rows = []
+            for i, s in enumerate(picks):
+                rows.append(fetch_ratios([f"{s}.NS"]))
+                bar.progress((i + 1) / len(picks), text=f"{s} — {i + 1} of {len(picks)}")
+            bar.empty()
+            st.session_state["_hunt_data"] = (
+                pd.concat(rows, ignore_index=True) if rows else pd.DataFrame())
+
+        hunt_data = st.session_state.get("_hunt_data", pd.DataFrame())
+        if not hunt_data.empty:
+            hd = hunt_data.copy()
+            hd["Matches"] = (
+                (hd["ROCE %"].fillna(-1e9) >= min_roce).astype(int)
+                + (hd["D/E"].fillna(1e9) <= max_de_h * 100).astype(int)
+                + (hd["Rev Growth %"].fillna(-1e9) >= min_growth).astype(int)
+                + (hd["Mkt Cap (Cr)"].fillna(1e9) <= max_mcap).astype(int)
+            )
+            cols = ["Ticker", "Name", "Sector", "Matches", "Mkt Cap (Cr)", "ROCE %",
+                    "ROE %", "D/E", "Rev Growth %", "Profit Growth %", "P/E", "P/B"]
+            hd = hd[[c for c in cols if c in hd.columns]].sort_values(
+                "Matches", ascending=False)
+            st.dataframe(hd.style.format(precision=2, na_rep="—"),
+                         use_container_width=True, hide_index=True)
+            st.caption(
+                "**Matches** counts how many of the four thresholds each company "
+                "clears. Blanks mean Yahoo has no data for that field — common in "
+                "exactly this size band, so a blank is a reason to go read the "
+                "annual report, not to exclude the company."
+            )
+            st.markdown(
+                '<div class="stale">Two checks this screen cannot make, both of '
+                'which sank companies that looked like this: <b>promoter pledging</b> '
+                '(Cupid itself has run around 25% of promoter holding pledged) and '
+                '<b>auditor or governance flags</b>. Neither is in any free feed. '
+                'Check the shareholding pattern on the BSE filing page before '
+                'putting money behind anything here.</div>',
+                unsafe_allow_html=True,
             )
 
 
