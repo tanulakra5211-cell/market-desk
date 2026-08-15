@@ -1462,6 +1462,125 @@ def chart_verdict(patterns: list, ca: dict) -> dict:
             "conviction": conviction}
 
 
+# ================================================ MARKET-WIDE PATTERN SCAN ===
+# Same patterns as the single-stock read, but computed columnwise across every
+# stock at once. Looping 2,000 symbols would take minutes; this takes seconds.
+
+def scan_market_patterns(hist: pd.DataFrame) -> pd.DataFrame:
+    """Detect patterns for every stock in the stored history."""
+    if hist.empty:
+        return pd.DataFrame()
+
+    def wide(col):
+        if col not in hist.columns:
+            return None
+        return hist.pivot_table(index="DATE", columns="SYMBOL",
+                                values=col, aggfunc="last").sort_index()
+
+    C, O, H, L, V = (wide(x) for x in ["CLOSE", "OPEN", "HIGH", "LOW", "VOLUME"])
+    if C is None or len(C) < 60:
+        return pd.DataFrame()
+
+    have_ohlc = all(x is not None and x.notna().any().any() for x in (O, H, L))
+    if not have_ohlc:
+        O, H, L = C, C, C   # degrade gracefully; candle patterns will be inert
+
+    n = len(C)
+    last = C.iloc[-1]
+    out = pd.DataFrame(index=C.columns)
+    out["Close"] = last
+
+    # --- momentum
+    delta = C.diff()
+    g = delta.clip(lower=0).rolling(14).mean()
+    ls = (-delta.clip(upper=0)).rolling(14).mean()
+    rsi_full = 100 - (100 / (1 + g / ls.replace(0, float("nan"))))
+    out["RSI"] = rsi_full.iloc[-1]
+
+    # --- moving averages
+    s50 = C.rolling(50).mean().iloc[-1] if n >= 50 else None
+    if s50 is not None:
+        out["Above 50DMA"] = last > s50
+    if n >= 200:
+        s200_series = C.rolling(200).mean()
+        s200 = s200_series.iloc[-1]
+        out["Above 200DMA"] = last > s200
+        cross = (C.rolling(50).mean() > s200_series)
+        out["Golden cross"] = cross.iloc[-1] & ~cross.iloc[-25]
+        out["Death cross"] = ~cross.iloc[-1] & cross.iloc[-25]
+
+    # --- breakouts against the prior 20 sessions
+    hi20 = H.iloc[-21:-1].max()
+    lo20 = L.iloc[-21:-1].min()
+    out["Breakout 20d"] = last > hi20
+    out["Breakdown 20d"] = last < lo20
+
+    # --- volume confirmation
+    avg_v = V.rolling(20).mean().iloc[-1]
+    out["Vol vs 20d"] = V.iloc[-1] / avg_v
+    out["Volume surge"] = out["Vol vs 20d"] >= 1.5
+
+    # --- consolidation: recent range tight against the longer one
+    r20 = (H.tail(20).max() - L.tail(20).min()) / last
+    r60 = (H.tail(60).max() - L.tail(60).min()) / last
+    out["Consolidating"] = r20 < r60 * 0.45
+
+    # --- trend structure proxy: rolling extremes stepping up or down
+    hi_now, hi_prev = H.tail(20).max(), H.iloc[-40:-20].max()
+    lo_now, lo_prev = L.tail(20).min(), L.iloc[-40:-20].min()
+    out["Higher highs & lows"] = (hi_now > hi_prev) & (lo_now > lo_prev)
+    out["Lower highs & lows"] = (hi_now < hi_prev) & (lo_now < lo_prev)
+
+    # --- RSI divergence over the last month
+    if n >= 40:
+        p_now, p_prev = C.iloc[-1], C.iloc[-21]
+        r_now, r_prev = rsi_full.iloc[-1], rsi_full.iloc[-21]
+        out["Bearish divergence"] = (p_now > p_prev * 1.02) & (r_now < r_prev - 5)
+        out["Bullish divergence"] = (p_now < p_prev * 0.98) & (r_now > r_prev + 5)
+
+    # --- candlestick formations on the last two bars
+    if have_ohlc:
+        o1, c1 = O.iloc[-2], C.iloc[-2]
+        o2, c2 = O.iloc[-1], C.iloc[-1]
+        out["Bullish engulfing"] = (c1 < o1) & (c2 > o2) & (c2 > o1) & (o2 < c1)
+        out["Bearish engulfing"] = (c1 > o1) & (c2 < o2) & (c2 < o1) & (o2 > c1)
+
+        body = (c2 - o2).abs()
+        rng = (H.iloc[-1] - L.iloc[-1]).replace(0, float("nan"))
+        upper = H.iloc[-1] - pd.concat([o2, c2], axis=1).max(axis=1)
+        lower = pd.concat([o2, c2], axis=1).min(axis=1) - L.iloc[-1]
+        out["Hammer"] = (lower > body * 2) & (upper < body)
+        out["Shooting star"] = (upper > body * 2) & (lower < body)
+        out["Doji"] = (body / rng) < 0.1
+
+    # --- weighted stance, mirroring the single-stock logic
+    bull_cols = ["Golden cross", "Breakout 20d", "Higher highs & lows",
+                 "Bullish divergence", "Bullish engulfing", "Hammer", "Above 50DMA"]
+    bear_cols = ["Death cross", "Breakdown 20d", "Lower highs & lows",
+                 "Bearish divergence", "Bearish engulfing", "Shooting star"]
+
+    bull = sum(out[c].fillna(False).astype(int) for c in bull_cols if c in out)
+    bear = sum(out[c].fillna(False).astype(int) for c in bear_cols if c in out)
+    if "Above 200DMA" in out and s50 is not None:
+        bull = bull + ((last > s50) & (out["Above 200DMA"].fillna(False))).astype(int)
+        bear = bear + ((last < s50) & (~out["Above 200DMA"].fillna(True))).astype(int)
+    bear = bear + (out["RSI"] > 70).fillna(False).astype(int)
+    bull = bull + (out["RSI"] < 30).fillna(False).astype(int)
+
+    out["Bull signals"] = bull
+    out["Bear signals"] = bear
+    out["Score"] = bull - bear
+    out["Stance"] = pd.cut(
+        out["Score"], bins=[-99, -3, -1, 0, 2, 99],
+        labels=["Negative", "Mildly negative", "Neutral",
+                "Mildly constructive", "Constructive"],
+    ).astype(str)
+
+    out = out.reset_index().rename(columns={"SYMBOL": "Symbol", "index": "Symbol"})
+    out["Has OHLC"] = have_ohlc
+    return out
+
+
 @contextmanager
 def safe_tab(name: str):
     """
@@ -1514,6 +1633,11 @@ def load_flows():
 @st.cache_data(ttl=3600)
 def load_fno_oi():
     return fetch_fno_participant_oi()
+
+
+@st.cache_data(ttl=1800)
+def cached_pattern_scan():
+    return scan_market_patterns(load_stored_history())
 
 
 @st.cache_data(ttl=1800)
@@ -1947,6 +2071,89 @@ with tab_tech, safe_tab("Technicals"):
                 "**Vol vs 20d avg** — above 2 means today's volume is double the "
                 "recent norm, which is worth pairing with the delivery % on the "
                 "Screener tab to tell accumulation from churn."
+            )
+
+
+    st.divider()
+    st.markdown("#### Pattern scan across all stocks")
+    st.caption(
+        "Runs the same pattern detection over every stock in your stored "
+        "history — instant, because it reads from disk rather than NSE."
+    )
+
+    scan_hist = cached_history()
+    if scan_hist.empty:
+        st.info(
+            "Needs stored history. Run the collector from the Actions tab "
+            "in GitHub first — see the Backtest tab."
+        )
+    else:
+        with st.spinner("Scanning…"):
+            scan = cached_pattern_scan()
+
+        if scan.empty:
+            st.warning("Not enough history to detect patterns. Needs 60+ trading days.")
+        else:
+            if not bool(scan["Has OHLC"].iloc[0]):
+                st.markdown(
+                    '<div class="stale">Your stored data has no open/high/low '
+                    'prices, so candlestick patterns (engulfing, hammer, doji) are '
+                    'switched off. Trend, breakout, crossover and divergence '
+                    'patterns still work. To enable the rest, update '
+                    '<code>collect.py</code> and re-run the workflow with the '
+                    '<b>refresh</b> option — the newer collector stores OHLC.</div>',
+                    unsafe_allow_html=True,
+                )
+
+            uni = load_universe()
+            if not uni.empty:
+                scan = scan.merge(uni[["Symbol", "Company"]], on="Symbol", how="left")
+
+            st.caption(f"{len(scan):,} stocks scanned.")
+
+            p1, p2 = st.columns([2, 2])
+            stance_pick = p1.multiselect(
+                "Stance", options=["Constructive", "Mildly constructive", "Neutral",
+                                   "Mildly negative", "Negative"],
+                default=["Constructive"], key="scan_stance")
+            flag_opts = [c for c in scan.columns if scan[c].dtype == bool
+                         and c not in ("Has OHLC",)]
+            must_have = p2.multiselect("Must show these patterns", options=flag_opts,
+                                       key="scan_flags")
+
+            sv = scan.copy()
+            if stance_pick:
+                sv = sv[sv["Stance"].isin(stance_pick)]
+            for flag in must_have:
+                sv = sv[sv[flag].fillna(False)]
+
+            sv = sv.sort_values("Score", ascending=False)
+            lead = [c for c in ["Symbol", "Company", "Stance", "Score",
+                                "Bull signals", "Bear signals", "Close", "RSI",
+                                "Vol vs 20d"] if c in sv.columns]
+            rest = [c for c in sv.columns if c not in lead + ["Has OHLC"]]
+
+            st.caption(f"{len(sv):,} stocks match.")
+            st.dataframe(sv[lead + rest].head(400),
+                         use_container_width=True, height=520, hide_index=True)
+            st.download_button("Download scan as CSV",
+                               data=sv.to_csv(index=False).encode("utf-8"),
+                               file_name="pattern_scan.csv", mime="text/csv",
+                               key="dl_scan")
+
+            counts = {c: int(scan[c].fillna(False).sum()) for c in flag_opts}
+            st.caption(
+                "Frequency today: "
+                + " · ".join(f"{k} {v}" for k, v in
+                             sorted(counts.items(), key=lambda x: -x[1])[:8])
+            )
+            st.markdown(
+                '<div class="stale">A pattern appearing in 400 of 2,000 stocks on '
+                'the same day is telling you about the market, not about those '
+                'stocks. Check the frequency line above before reading anything '
+                'into a signal — and test it on the Backtest tab, which is the '
+                'only way to know whether a setup has paid on your names.</div>',
+                unsafe_allow_html=True,
             )
 
     st.divider()
