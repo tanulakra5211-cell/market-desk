@@ -30,6 +30,7 @@ st.set_page_config(
 )
 
 DATA_DIR = Path(__file__).parent / "data"
+APP_VERSION = "v7 — patterns"
 
 
 # ============================================================ DEFAULT DATA ===
@@ -1288,7 +1289,177 @@ def analyse_chart(ticker: str) -> dict | None:
         "range_1m": band(21),
         "hi52": float(close.max()), "lo52": float(close.min()),
         "series": close.tail(120),
+        "ohlc": hist,
     }
+
+
+# ====================================================== PATTERN DETECTION ====
+# Real detection on real bars: trend structure, MA crossovers, range breakouts,
+# double tops/bottoms, RSI divergence and the standard candlestick formations.
+#
+# On reliability: these are descriptive patterns with weak and unstable
+# predictive power. Published tests of candlestick patterns on liquid equities
+# generally find edges close to zero after costs. Treat the read below as a
+# structured description of what the chart shows, with the odds barely tilted.
+
+def detect_patterns(hist: pd.DataFrame) -> list:
+    """Return a list of (pattern, direction, note) found in the price data."""
+    found = []
+    c, h, l, o = hist["Close"], hist["High"], hist["Low"], hist["Open"]
+    v = hist["Volume"]
+    n = len(c)
+    if n < 60:
+        return found
+
+    last = float(c.iloc[-1])
+
+    # --- Trend structure from swing points
+    win = 5
+    sh = h[(h == h.rolling(win * 2 + 1, center=True).max())].dropna()
+    sl = l[(l == l.rolling(win * 2 + 1, center=True).min())].dropna()
+    if len(sh) >= 2 and len(sl) >= 2:
+        hh = sh.iloc[-1] > sh.iloc[-2]
+        hl = sl.iloc[-1] > sl.iloc[-2]
+        if hh and hl:
+            found.append(("Higher highs and higher lows", "bullish",
+                          "Textbook uptrend structure."))
+        elif not hh and not hl:
+            found.append(("Lower highs and lower lows", "bearish",
+                          "Textbook downtrend structure."))
+        else:
+            found.append(("Mixed swing structure", "neutral",
+                          "Highs and lows disagree — no clean trend."))
+
+    # --- Double top / bottom
+    if len(sh) >= 2:
+        a, b = float(sh.iloc[-2]), float(sh.iloc[-1])
+        if abs(a - b) / a < 0.03 and last < min(a, b) * 0.97:
+            found.append(("Possible double top", "bearish",
+                          f"Two highs near Rs {b:,.0f}, price has rolled over."))
+    if len(sl) >= 2:
+        a, b = float(sl.iloc[-2]), float(sl.iloc[-1])
+        if abs(a - b) / a < 0.03 and last > max(a, b) * 1.03:
+            found.append(("Possible double bottom", "bullish",
+                          f"Two lows near Rs {b:,.0f}, price has lifted off."))
+
+    # --- Moving average crossover, recent only
+    if n >= 200:
+        s50, s200 = c.rolling(50).mean(), c.rolling(200).mean()
+        above = s50 > s200
+        recent = above.tail(25)
+        if recent.iloc[-1] and not recent.iloc[0]:
+            found.append(("Golden cross (50 above 200)", "bullish",
+                          "50-day crossed above the 200-day this month."))
+        elif not recent.iloc[-1] and recent.iloc[0]:
+            found.append(("Death cross (50 below 200)", "bearish",
+                          "50-day crossed below the 200-day this month."))
+
+    # --- Consolidation and breakout
+    recent_range = (h.tail(20).max() - l.tail(20).min()) / last
+    prior_range = (h.tail(60).max() - l.tail(60).min()) / last
+    if recent_range < prior_range * 0.45:
+        found.append(("Consolidation / tightening range", "neutral",
+                      f"Last 20 days span only {recent_range * 100:.1f}%."))
+
+    hi20 = float(h.iloc[-21:-1].max())
+    lo20 = float(l.iloc[-21:-1].min())
+    vol_ok = float(v.iloc[-1]) > float(v.tail(20).mean()) * 1.4
+    if last > hi20:
+        found.append(("Breakout above 20-day high", "bullish",
+                      "With volume confirmation." if vol_ok
+                      else "But volume is not confirming — weaker signal."))
+    elif last < lo20:
+        found.append(("Breakdown below 20-day low", "bearish",
+                      "With volume confirmation." if vol_ok
+                      else "But volume is not confirming — weaker signal."))
+
+    # --- RSI divergence
+    if n >= 40:
+        delta = c.diff()
+        g = delta.clip(lower=0).rolling(14).mean()
+        ls = (-delta.clip(upper=0)).rolling(14).mean()
+        rsi_s = 100 - (100 / (1 + g / ls.replace(0, float("nan"))))
+        p_now, p_prev = float(c.iloc[-1]), float(c.iloc[-21])
+        r_now, r_prev = float(rsi_s.iloc[-1]), float(rsi_s.iloc[-21])
+        if p_now > p_prev * 1.02 and r_now < r_prev - 5:
+            found.append(("Bearish RSI divergence", "bearish",
+                          "Price made a higher high, momentum did not."))
+        elif p_now < p_prev * 0.98 and r_now > r_prev + 5:
+            found.append(("Bullish RSI divergence", "bullish",
+                          "Price made a lower low, momentum did not."))
+
+    # --- Candlestick formations on the latest bars
+    body = (c - o).abs()
+    rng = (h - l).replace(0, float("nan"))
+    for i in [-1, -2]:
+        oi, ci, hi_, li = float(o.iloc[i]), float(c.iloc[i]), float(h.iloc[i]), float(l.iloc[i])
+        bi, ri = float(body.iloc[i]), float(rng.iloc[i])
+        if ri != ri or ri == 0:
+            continue
+        when = "today" if i == -1 else "yesterday"
+
+        if bi / ri < 0.1:
+            found.append((f"Doji ({when})", "neutral", "Open and close nearly equal — indecision."))
+        lower_wick = min(oi, ci) - li
+        upper_wick = hi_ - max(oi, ci)
+        if lower_wick > bi * 2 and upper_wick < bi:
+            found.append((f"Hammer ({when})", "bullish", "Long lower wick — sellers rejected."))
+        if upper_wick > bi * 2 and lower_wick < bi:
+            found.append((f"Shooting star ({when})", "bearish", "Long upper wick — buyers rejected."))
+
+    if n >= 2:
+        o1, c1 = float(o.iloc[-2]), float(c.iloc[-2])
+        o2, c2 = float(o.iloc[-1]), float(c.iloc[-1])
+        if c1 < o1 and c2 > o2 and c2 > o1 and o2 < c1:
+            found.append(("Bullish engulfing", "bullish", "Today's up bar swallows yesterday's down bar."))
+        if c1 > o1 and c2 < o2 and c2 < o1 and o2 > c1:
+            found.append(("Bearish engulfing", "bearish", "Today's down bar swallows yesterday's up bar."))
+
+    return found
+
+
+def chart_verdict(patterns: list, ca: dict) -> dict:
+    """Weigh the detected patterns into a single positional read."""
+    weights = {"bullish": 0, "bearish": 0}
+    for _, direction, _ in patterns:
+        if direction in weights:
+            weights[direction] += 1
+
+    # Trend and momentum carry more than any single candle
+    if ca["sma200"] and ca["last"] > ca["sma50"] > ca["sma200"]:
+        weights["bullish"] += 2
+    elif ca["sma200"] and ca["last"] < ca["sma50"] < ca["sma200"]:
+        weights["bearish"] += 2
+    if ca["rsi"] > 70:
+        weights["bearish"] += 1
+    elif ca["rsi"] < 30:
+        weights["bullish"] += 1
+
+    net = weights["bullish"] - weights["bearish"]
+    total = weights["bullish"] + weights["bearish"]
+
+    if net >= 3:
+        stance, tone = "Constructive", "up"
+    elif net >= 1:
+        stance, tone = "Mildly constructive", "up"
+    elif net <= -3:
+        stance, tone = "Negative", "down"
+    elif net <= -1:
+        stance, tone = "Mildly negative", "down"
+    else:
+        stance, tone = "Neutral / no edge", "flat"
+
+    agreement = abs(net) / total if total else 0
+    if agreement > 0.6 and total >= 4:
+        conviction = "Signals mostly agree"
+    elif total >= 3:
+        conviction = "Signals are mixed"
+    else:
+        conviction = "Few signals — little to read"
+
+    return {"stance": stance, "tone": tone, "net": net,
+            "bull": weights["bullish"], "bear": weights["bearish"],
+            "conviction": conviction}
 
 
 @contextmanager
@@ -1443,7 +1614,7 @@ watchlist = load_watchlist()
 
 with st.sidebar:
     st.markdown("### Market Desk")
-    st.caption("Indian equities, one screen")
+    st.caption(f"Indian equities, one screen · {APP_VERSION}")
 
     name_by_ticker = watchlist.set_index("ticker")["company"].to_dict()
     selected = st.multiselect(
@@ -1830,6 +2001,80 @@ with tab_tech, safe_tab("Technicals"):
                 'outcomes land inside a band like this; the other third is what '
                 'position sizing is for. A single earnings release or order '
                 'announcement voids the whole calculation.</div>',
+                unsafe_allow_html=True,
+            )
+
+
+            st.divider()
+            st.markdown("**What the chart is showing**")
+
+            pats = detect_patterns(ca["ohlc"])
+            verdict = chart_verdict(pats, ca)
+
+            colour = {"up": "#2fbf71", "down": "#e5484d", "flat": "#6b7684"}[verdict["tone"]]
+            st.markdown(
+                f'<div style="border-left:3px solid {colour};padding:0.7rem 1rem;'
+                f'background:#141a21;margin:0.5rem 0;">'
+                f'<div style="font-size:1.15rem;font-weight:650;color:{colour};">'
+                f'{verdict["stance"]}</div>'
+                f'<div style="color:#8b95a1;font-size:0.85rem;">'
+                f'{verdict["bull"]} bullish vs {verdict["bear"]} bearish signals · '
+                f'{verdict["conviction"]}</div></div>',
+                unsafe_allow_html=True,
+            )
+
+            if pats:
+                for name, direction, note in pats:
+                    mark = {"bullish": "▲", "bearish": "▼", "neutral": "■"}[direction]
+                    col = {"bullish": "#2fbf71", "bearish": "#e5484d",
+                           "neutral": "#6b7684"}[direction]
+                    st.markdown(
+                        f'<div style="padding:0.3rem 0;border-bottom:1px solid #1a2028;">'
+                        f'<span style="color:{col};">{mark}</span> '
+                        f'<b>{name}</b> — <span style="color:#8b95a1;">{note}</span></div>',
+                        unsafe_allow_html=True,
+                    )
+            else:
+                st.caption("No recognised patterns in the recent bars.")
+
+            lo1m, hi1m = ca["range_1m"]
+            if verdict["tone"] == "up":
+                narrative = (
+                    f"Structure leans higher. If it holds, the levels that matter are "
+                    f"resistance at "
+                    f"{', '.join(f'Rs {x:,.0f}' for x in ca['resistance'][:2]) or 'the 52-week high'}. "
+                    f"The read fails if it loses "
+                    f"Rs {ca['support'][0]:,.0f}" if ca['support'] else "recent support"
+                )
+            elif verdict["tone"] == "down":
+                narrative = (
+                    f"Structure leans lower. Support to watch: "
+                    f"{', '.join(f'Rs {x:,.0f}' for x in ca['support'][:2]) or 'the 52-week low'}. "
+                    f"The read fails if it reclaims "
+                    f"Rs {ca['resistance'][0]:,.0f}" if ca['resistance'] else "recent resistance"
+                )
+            else:
+                narrative = (
+                    f"No directional edge in the chart. It has been ranging between "
+                    f"Rs {ca['support'][0]:,.0f} and Rs {ca['resistance'][0]:,.0f}"
+                    if ca['support'] and ca['resistance']
+                    else "No directional edge in the chart"
+                )
+
+            st.markdown(f"**One-month read.** {narrative}. "
+                        f"Volatility puts the likely band at "
+                        f"Rs {lo1m:,.0f}–{hi1m:,.0f}.")
+
+            st.markdown(
+                '<div class="stale"><b>How much to trust this.</b> Every pattern '
+                'above is real and detected from the actual bars — but tested on '
+                'liquid equities, candlestick and chart patterns show edges close '
+                'to zero once costs are counted, and they fail more often than the '
+                'textbooks suggest. The stance is a weighted tally of what the '
+                'chart shows, not a probability. It knows nothing about earnings, '
+                'orders, or promoter activity, any one of which overrides the whole '
+                'read overnight. Use the Backtest tab to check whether this kind of '
+                'setup has actually worked on your names.</div>',
                 unsafe_allow_html=True,
             )
 
