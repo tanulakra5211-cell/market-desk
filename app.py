@@ -30,7 +30,7 @@ st.set_page_config(
 )
 
 DATA_DIR = Path(__file__).parent / "data"
-APP_VERSION = "v12 — 52w range"
+APP_VERSION = "v13 — setups"
 
 
 # ============================================================ DEFAULT DATA ===
@@ -2059,6 +2059,14 @@ def load_fno_oi():
     return fetch_fno_participant_oi()
 
 
+@st.cache_data(ttl=21600, show_spinner=False)
+def cached_setups(min_turnover: float, min_rr: float):
+    inputs = compute_setup_inputs(load_stored_history())
+    if inputs.empty:
+        return pd.DataFrame()
+    return weekly_setups(inputs, min_turnover, min_rr)
+
+
 @st.cache_data(ttl=1800)
 def cached_pattern_scan():
     return scan_market_patterns(load_stored_history())
@@ -2248,12 +2256,258 @@ def load_market_screen():
     return screen, latest_date, attempts
 
 
+# ========================================================= WEEKLY SETUPS =====
+# Named chart configurations across the whole market, each with levels taken
+# from actual price structure rather than round numbers: stops sit below the
+# swing that would invalidate the idea, targets at the next structural level.
+#
+# Risk/reward here is arithmetic on those levels. It is not a probability. A
+# 3:1 setup that works one time in five loses money. The Backtest tab is the
+# only way to find out which of these has actually paid on your names.
+
+def compute_setup_inputs(hist: pd.DataFrame) -> pd.DataFrame:
+    """Everything the setup rules need, computed across all stocks at once."""
+    if hist.empty:
+        return pd.DataFrame()
+
+    keep = sorted(hist["DATE"].unique())[-260:]
+    h = hist[hist["DATE"].isin(keep)]
+
+    def wide(col):
+        if col not in h.columns:
+            return None
+        return h.pivot_table(index="DATE", columns="SYMBOL", values=col,
+                             aggfunc="last").sort_index().astype("float32")
+
+    C, H, L, V, D = (wide(x) for x in ["CLOSE", "HIGH", "LOW", "VOLUME", "DELIV_PER"])
+    if C is None or len(C) < 60:
+        return pd.DataFrame()
+    if H is None or not H.notna().any().any():
+        H = C
+    if L is None or not L.notna().any().any():
+        L = C
+
+    n = len(C)
+    last = C.iloc[-1]
+    out = pd.DataFrame({"Symbol": C.columns, "Close": last.values})
+
+    # True range -> ATR. Falls back to close-to-close where OHLC is absent.
+    tr = pd.concat([(H - L).stack(), (H - C.shift()).abs().stack(),
+                    (L - C.shift()).abs().stack()], axis=1).max(axis=1).unstack()
+    atr = tr.rolling(14).mean().iloc[-1]
+    out["ATR"] = atr.reindex(C.columns).values
+    out["ATR %"] = (atr / last * 100).reindex(C.columns).values
+
+    for w in (20, 50, 200):
+        if n >= w:
+            out[f"SMA{w}"] = C.rolling(w).mean().iloc[-1].reindex(C.columns).values
+
+    delta = C.diff()
+    g = delta.clip(lower=0).rolling(14).mean()
+    ls = (-delta.clip(upper=0)).rolling(14).mean()
+    rsi = 100 - (100 / (1 + g / ls.replace(0, float("nan"))))
+    out["RSI"] = rsi.iloc[-1].reindex(C.columns).values
+
+    out["High20"] = H.iloc[-21:-1].max().reindex(C.columns).values
+    out["Low20"] = L.iloc[-21:-1].min().reindex(C.columns).values
+    out["High52"] = C.max().reindex(C.columns).values
+    out["Low52"] = C.min().reindex(C.columns).values
+
+    # Most recent swing low: the lowest point of the last 10 sessions, which is
+    # where a long idea stops being right.
+    out["SwingLow"] = L.tail(10).min().reindex(C.columns).values
+    out["SwingHigh"] = H.tail(10).max().reindex(C.columns).values
+
+    r20 = (H.tail(20).max() - L.tail(20).min()) / last
+    r60 = (H.tail(60).max() - L.tail(60).min()) / last
+    out["Tight"] = (r20 < r60 * 0.45).reindex(C.columns).values
+    out["RangeHeight"] = (H.tail(20).max() - L.tail(20).min()).reindex(C.columns).values
+
+    if V is not None:
+        avgv = V.rolling(20).mean().iloc[-1]
+        out["VolX"] = (V.iloc[-1] / avgv).reindex(C.columns).values
+        out["Turnover proxy"] = (V.iloc[-1] * last).reindex(C.columns).values
+
+    if D is not None and D.notna().any().any():
+        out["Delivery %"] = D.tail(5).mean().reindex(C.columns).values
+        out["Delivery trend"] = (D.tail(5).mean() - D.tail(20).mean()
+                                 ).reindex(C.columns).values
+
+    for label, back in [("1M %", 21), ("3M %", 63)]:
+        if n > back:
+            base = C.iloc[-back - 1]
+            out[label] = (((last - base) / base) * 100).reindex(C.columns).values
+
+    return out
+
+
+def weekly_setups(inp: pd.DataFrame, min_turnover_cr: float = 1.0,
+                  min_rr: float = 1.5) -> pd.DataFrame:
+    """
+    Classify each stock into a named setup, with levels.
+
+    A stock can only appear once — the first rule that matches wins, ordered
+    from most specific to least. Otherwise the same name shows up under four
+    headings and the list stops meaning anything.
+    """
+    if inp.empty:
+        return pd.DataFrame()
+
+    df = inp.copy()
+    if "Turnover proxy" in df.columns:
+        df = df[df["Turnover proxy"].fillna(0) >= min_turnover_cr * 1e7]
+
+    rows = []
+    for _, r in df.iterrows():
+        close, atr = r.get("Close"), r.get("ATR")
+        if not (close == close) or not (atr == atr) or atr <= 0:
+            continue
+
+        s50, s200 = r.get("SMA50", float("nan")), r.get("SMA200", float("nan"))
+        rsi, volx = r.get("RSI", float("nan")), r.get("VolX", 1.0)
+        above200 = s200 == s200 and close > s200
+        above50 = s50 == s50 and close > s50
+        dtrend = r.get("Delivery trend", 0) or 0
+
+        setup = stop = target = note = None
+
+        # 1. Breakout from a tight range, confirmed by volume
+        if r.get("Tight") and close > r.get("High20", 1e18) and volx >= 1.5:
+            setup = "Range breakout"
+            stop = min(r["Low20"], close - 1.5 * atr)
+            target = close + max(r.get("RangeHeight", 0), 2 * atr)
+            note = "Broke a tightening range on above-average volume."
+
+        # 2. New 52-week high in an established uptrend
+        elif above200 and close >= r.get("High52", 1e18) * 0.995 and volx >= 1.2:
+            setup = "52-week high breakout"
+            stop = close - 2 * atr
+            target = close + 4 * atr
+            note = "At a yearly high with the long-term trend already up."
+
+        # 3. Pullback to the 50-day inside a genuine uptrend.
+        # "Above the 200DMA" alone is far too loose -- roughly half the market
+        # qualifies on any given day. This also demands the 50 above the 200
+        # and real three-month progress, so a drifting stock does not read as
+        # a pullback in an uptrend it never had.
+        elif (above200 and s50 == s50 and s50 > s200
+              and abs(close - s50) / s50 < 0.03
+              and 38 <= rsi <= 58
+              and (r.get("3M %", -1e9) or -1e9) > 5):
+            setup = "Pullback to 50DMA"
+            stop = min(r.get("SwingLow", close - 2 * atr), s50 - 1.5 * atr)
+            target = max(r.get("SwingHigh", close + 3 * atr), close + 2.5 * atr)
+            note = "Uptrend intact, price has come back to the 50-day line."
+
+        # 4. Oversold while the long-term trend is still up
+        elif (above200 and rsi < 35 and s50 == s50 and s50 > s200
+              and (r.get("3M %", -1e9) or -1e9) > -15):
+            setup = "Oversold in uptrend"
+            stop = r.get("SwingLow", close - 2 * atr)
+            target = s50 if s50 == s50 and s50 > close else close + 3 * atr
+            note = "Above the 200-day but short-term momentum is washed out."
+
+        # 5. Quiet accumulation: delivery rising without a price spike
+        elif dtrend > 5 and volx >= 1.3 and above50:
+            setup = "Delivery accumulation"
+            stop = close - 2 * atr
+            target = close + 3 * atr
+            note = ("Rising share of volume taken as delivery — buyers holding "
+                    "rather than trading.")
+
+        # 6. Breaking down
+        elif close < r.get("Low20", -1e18) and not above50:
+            setup = "Breakdown"
+            stop = close + 1.5 * atr
+            target = close - 3 * atr
+            note = "Below the 20-day low with the medium trend already down."
+
+        if setup is None:
+            continue
+
+        direction = "short" if setup == "Breakdown" else "long"
+        if direction == "long":
+            risk, reward = close - stop, target - close
+        else:
+            risk, reward = stop - close, close - target
+        if risk <= 0:
+            continue
+
+        rr = reward / risk
+        if rr < min_rr:
+            continue
+
+        # Confirmation score: how many independent things agree. Not a
+        # probability -- a count of corroborating signals, nothing more.
+        score = 0
+        if volx == volx and volx >= 1.5:
+            score += 1
+        if dtrend == dtrend and dtrend > 3:
+            score += 1
+        if direction == "long" and above200:
+            score += 1
+        if direction == "short" and not above200:
+            score += 1
+        if rr >= 2.5:
+            score += 1
+        risk_pct = (risk / close) * 100
+        if 1.0 <= risk_pct <= 8.0:      # a stop that is neither tight nor absurd
+            score += 1
+
+        rows.append({
+            "Symbol": r["Symbol"], "Setup": setup, "Bias": direction,
+            "Confirmations": score,
+            "Entry": close, "Stop": stop, "Target": target,
+            "Risk %": risk_pct,
+            "Reward %": (reward / close) * 100,
+            "R:R": rr,
+            "RSI": rsi, "Vol x": volx,
+            "Delivery trend": r.get("Delivery trend", float("nan")),
+            "ATR %": r.get("ATR %", float("nan")),
+            "1M %": r.get("1M %", float("nan")),
+            "Note": note,
+        })
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values(["Confirmations", "R:R"], ascending=[False, False])
+
+
+def position_size(capital: float, risk_pct: float, entry: float, stop: float):
+    """
+    Shares such that being stopped out costs a fixed share of capital.
+
+    This is the part that decides outcomes far more than setup selection, and
+    it is arithmetic rather than opinion.
+    """
+    risk_per_share = abs(entry - stop)
+    if risk_per_share <= 0 or entry <= 0:
+        return 0, 0.0
+    budget = capital * (risk_pct / 100.0)
+    shares = int(budget // risk_per_share)
+    return shares, shares * entry
+
+
 # ============================================================== GLOSSARY =====
 # Every term the app shows, in plain English. Definitions say what a number
 # measures AND what it does not tell you -- the second half is usually the
 # part that costs money.
 
 GLOSSARY = {
+    "Reward %": "Distance from entry to target, as a percentage.",
+    "Risk %": "Distance from entry to stop, as a percentage. A wider stop means a smaller position.",
+    "Target": "The next structural level, or a multiple of typical daily range.",
+    "Stop": "Where the idea stops being right, placed below the structure that would invalidate it.",
+    "Entry": "The current price. Levels are computed from it.",
+    "R:R": "Reward divided by risk, from the levels shown. Arithmetic, not odds — a 3:1 setup that works one time in five loses money.",
+    "Confirmations": "How many independent things agree, out of six. A count of corroborating signals, not a probability.",
+    "Breakdown": "Below the 20-day low with the medium-term trend already down.",
+    "Delivery accumulation": "A rising share of volume taken as delivery — buyers holding rather than trading.",
+    "Oversold in uptrend": "Above the 200-day average but short-term momentum washed out.",
+    "Pullback to 50DMA": "An established uptrend where price has come back to its 50-day average.",
+    "52-week high breakout": "At a yearly high with the long-term trend already up.",
+    "Range breakout": "Price has broken above a tightening range on above-average volume.",
     # --- price and market
     "Day %": "Change from yesterday's close to today's, in percent.",
     "1M %": "Return over about 21 trading days. Not annualised.",
@@ -2565,10 +2819,11 @@ st.markdown(f'<div class="pulse-strip">{"".join(cells)}</div>', unsafe_allow_htm
 
 # ================================================================= TABS ======
 
-(tab_market, tab_screen, tab_tech, tab_opt, tab_hunt, tab_test, tab_news,
- tab_flows, tab_ratios, tab_book, tab_depth) = st.tabs(
-    ["Markets", "Screener (all NSE)", "Technicals", "Options", "Small-cap hunt",
-     "Backtest", "News", "FII / DII", "Ratios", "Order Book", "Depth"]
+(tab_market, tab_setups, tab_screen, tab_tech, tab_opt, tab_hunt, tab_test,
+ tab_news, tab_flows, tab_ratios, tab_book, tab_depth) = st.tabs(
+    ["Markets", "Weekly setups", "Screener (all NSE)", "Technicals", "Options",
+     "Small-cap hunt", "Backtest", "News", "FII / DII", "Ratios", "Order Book",
+     "Depth"]
 )
 
 with tab_market, safe_tab("Markets"):
@@ -2601,6 +2856,112 @@ with tab_market, safe_tab("Markets"):
                      column_config=help_config(global_df.drop(columns=["Symbol"])),
                 use_container_width=True, height=520, hide_index=True,
             )
+
+
+with tab_setups, safe_tab("Weekly setups"):
+    st.markdown("#### Weekly setups")
+    st.markdown(
+        "Named chart configurations across the whole market, each with levels "
+        "taken from price structure — the stop sits where the idea stops being "
+        "right, the target at the next structural level."
+    )
+    glossary_panel("What do these setups mean?")
+
+    if not HISTORY_DIR.exists() or not any(HISTORY_DIR.glob("*.csv.gz")):
+        st.info("Needs stored history. Run the collector — see the Backtest tab.")
+    else:
+        s1, s2, s3 = st.columns(3)
+        su_turn = s1.number_input("Min turnover (Cr)", value=2.0, step=0.5,
+                                  key="su_turn",
+                                  help="Liquidity floor. Below this you cannot "
+                                       "exit at the price you see.")
+        su_rr = s2.number_input("Min reward:risk", value=1.5, step=0.5, key="su_rr")
+        su_conf = s3.number_input("Min confirmations", value=2, min_value=0,
+                                  max_value=6, step=1, key="su_conf",
+                                  help="How many independent things agree, out of six.")
+
+        if st.button("Scan for setups", type="primary", key="su_go"):
+            st.session_state["_run_setups"] = True
+
+        if st.session_state.get("_run_setups"):
+            with st.spinner("Scanning the market…"):
+                setups = cached_setups(su_turn, su_rr)
+
+            if setups.empty:
+                st.warning("Nothing matched. Loosen the filters, or the store "
+                           "may not have 60+ trading days yet.")
+            else:
+                view = setups[setups["Confirmations"] >= su_conf]
+                uni = symbol_universe()
+                if not uni.empty:
+                    view = view.merge(uni[["Symbol", "Company"]], on="Symbol",
+                                      how="left")
+
+                by_setup = setups["Setup"].value_counts()
+                st.caption(f"{len(view)} setups pass · from {len(setups)} found · "
+                           + " · ".join(f"{k} {v}" for k, v in by_setup.items()))
+
+                lead = [c for c in ["Symbol", "Company", "Setup", "Bias",
+                                    "Confirmations", "Entry", "Stop", "Target",
+                                    "Risk %", "Reward %", "R:R"] if c in view.columns]
+                rest = [c for c in view.columns if c not in lead + ["Note"]]
+                st.dataframe(
+                    colour_frame(view[lead + rest], ["Risk %", "Reward %", "1M %",
+                                                     "Delivery trend"]),
+                    column_config=help_config(view),
+                    use_container_width=True, height=460, hide_index=True)
+
+                st.download_button("Download setups as CSV",
+                                   data=view.to_csv(index=False).encode("utf-8"),
+                                   file_name="weekly_setups.csv", mime="text/csv",
+                                   key="su_dl")
+
+                st.markdown(
+                    '<div class="stale"><b>I tested these rules against random '
+                    'walks, and roughly half the setups came from pure noise.</b> '
+                    'That is not a flaw in the code — random price data genuinely '
+                    'produces breakouts, pullbacks and consolidations, because '
+                    'those shapes occur in any random series. It means a setup '
+                    'appearing here is evidence of a shape, not of an edge. The '
+                    'Backtest tab exists precisely to tell you which of these has '
+                    'actually paid on your names, and until you run it you have no '
+                    'basis for believing any of them.</div>',
+                    unsafe_allow_html=True)
+
+                st.divider()
+                st.markdown("**Position sizing**")
+                st.caption("This decides outcomes more than setup selection, and "
+                           "unlike setup selection it is arithmetic.")
+
+                z1, z2, z3 = st.columns(3)
+                capital = z1.number_input("Capital (Rs)", value=1000000.0,
+                                          step=50000.0, key="su_cap")
+                risk_pct = z2.number_input("Risk per trade %", value=1.0, step=0.25,
+                                           key="su_risk",
+                                           help="Share of capital lost if stopped out.")
+                pick_sym = z3.selectbox("Size which setup",
+                                        view["Symbol"].tolist(), key="su_pick")
+
+                row = view[view["Symbol"] == pick_sym].iloc[0]
+                shares, deployed = position_size(capital, risk_pct,
+                                                 row["Entry"], row["Stop"])
+                q1, q2, q3, q4 = st.columns(4)
+                q1.metric("Shares", f"{shares:,}")
+                q2.metric("Capital deployed", f"Rs {deployed:,.0f}")
+                q3.metric("Loss if stopped",
+                          f"Rs {shares * abs(row['Entry'] - row['Stop']):,.0f}")
+                q4.metric("Gain if target hit",
+                          f"Rs {shares * abs(row['Target'] - row['Entry']):,.0f}")
+
+                st.caption(
+                    f"**{row['Setup']}** — {row['Note']} Entry Rs {row['Entry']:,.2f}, "
+                    f"stop Rs {row['Stop']:,.2f}, target Rs {row['Target']:,.2f}. "
+                    f"Deploying Rs {deployed:,.0f} risks {risk_pct}% of capital "
+                    f"because the stop is {row['Risk %']:.1f}% away — a wider stop "
+                    "means a smaller position, not a bigger loss."
+                )
+        else:
+            st.info("Click Scan to run. Reads from disk, so it takes seconds.")
 
 
 with tab_screen, safe_tab("Screener"):
