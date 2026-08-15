@@ -1590,6 +1590,52 @@ def scan_market_patterns(hist: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+@st.cache_data(ttl=3600)
+def symbol_universe() -> pd.DataFrame:
+    """
+    Every tradable NSE symbol, from whichever source answers.
+
+    NSE's equity-list file refuses requests often enough that it cannot be the
+    only source. The stored history is the better fallback -- it needs no
+    network at all and contains every symbol that actually traded.
+    """
+    # 1. NSE's official list (has company names)
+    uni = load_universe()
+    if not uni.empty and "Symbol" in uni.columns:
+        uni = uni.copy()
+        uni["Source"] = "NSE list"
+        return uni
+
+    # 2. Stored history on disk -- no network needed
+    try:
+        if HISTORY_DIR.exists():
+            syms = set()
+            for f in sorted(HISTORY_DIR.glob("*.csv.gz"))[-3:]:
+                syms.update(pd.read_csv(f, usecols=["SYMBOL"],
+                                        skipinitialspace=True)["SYMBOL"].unique())
+            if syms:
+                return pd.DataFrame({"Symbol": sorted(syms),
+                                     "Company": sorted(syms),
+                                     "Source": "stored history"})
+    except Exception:
+        pass
+
+    # 3. Today's bhavcopy, if the screener already fetched it
+    try:
+        screen, _, _ = load_market_screen()
+        if not screen.empty and "Symbol" in screen.columns:
+            out = screen[["Symbol"]].copy()
+            out["Company"] = (screen["Company"] if "Company" in screen.columns
+                              else screen["Symbol"])
+            out["Source"] = "today's bhavcopy"
+            return out
+    except Exception:
+        pass
+
+    return pd.DataFrame(columns=["Symbol", "Company", "Source"])
+
+
+
 @contextmanager
 def safe_tab(name: str):
     """
@@ -2053,7 +2099,10 @@ with tab_tech, safe_tab("Technicals"):
                        if tech_source == "Screener shortlist" else tickers)
 
     if tech_source != "All NSE stocks" and not tech_target:
-        st.info("Nothing selected. Build a shortlist on the Screener tab first.")
+        st.info(
+            "Nothing selected. Switch the Universe above to **All NSE stocks**, "
+            "or build a shortlist on the Screener tab."
+        )
     elif tech_source != "All NSE stocks":
         with st.spinner("Computing indicators…"):
             tech = load_technicals(tech_target)
@@ -2121,7 +2170,7 @@ with tab_tech, safe_tab("Technicals"):
                     unsafe_allow_html=True,
                 )
 
-            uni = load_universe()
+            uni = symbol_universe()
             if not uni.empty:
                 scan = scan.merge(uni[["Symbol", "Company"]], on="Symbol", how="left")
 
@@ -2176,23 +2225,30 @@ with tab_tech, safe_tab("Technicals"):
     st.markdown("#### Single stock chart read")
     st.caption("Pick any listed stock — this does not depend on your watchlist.")
 
-    chart_univ = load_universe()
+    chart_univ = symbol_universe()
 
-    # Every listed NSE stock, not just the watchlist. Fall back to the
-    # watchlist only if NSE's symbol list can't be reached.
     if not chart_univ.empty:
         chart_names = dict(zip(chart_univ["Symbol"], chart_univ["Company"]))
         all_opts = [f"{s}.NS" for s in sorted(chart_univ["Symbol"])]
         watch_first = [t for t in tickers if t in all_opts]
         all_opts = watch_first + [t for t in all_opts if t not in watch_first]
+        src_label = chart_univ["Source"].iloc[0]
         st.caption(
-            f"{len(all_opts):,} NSE stocks — start typing to search. "
-            "Your watchlist is at the top."
+            f"{len(all_opts):,} stocks (via {src_label}) — start typing to "
+            "search. Your watchlist is at the top."
         )
     else:
         chart_names = {}
         all_opts = sorted(set(list(tickers) + list(st.session_state.get("shortlist", []))))
-        st.caption("NSE symbol list unavailable — showing your watchlist only.")
+        st.caption(
+            "No symbol source reachable. Showing your watchlist — collect some "
+            "history from the Backtest tab and the full list works offline."
+        )
+
+    st.caption(
+        "Any NSE symbol works even if it is not listed above: type it with a "
+        "`.NS` suffix in the box below if the dropdown is short."
+    )
 
     def chart_label(t):
         if t in name_by_ticker:
