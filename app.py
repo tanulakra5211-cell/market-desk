@@ -2158,13 +2158,38 @@ with tab_tech, safe_tab("Technicals"):
 
     st.divider()
     st.markdown("#### Single stock chart read")
+    st.caption("Pick any listed stock — this does not depend on your watchlist.")
 
-    all_opts = sorted(set(list(tickers) + list(st.session_state.get("shortlist", []))))
+    chart_univ = load_universe()
+
+    # Every listed NSE stock, not just the watchlist. Fall back to the
+    # watchlist only if NSE's symbol list can't be reached.
+    if not chart_univ.empty:
+        chart_names = dict(zip(chart_univ["Symbol"], chart_univ["Company"]))
+        all_opts = [f"{s}.NS" for s in sorted(chart_univ["Symbol"])]
+        watch_first = [t for t in tickers if t in all_opts]
+        all_opts = watch_first + [t for t in all_opts if t not in watch_first]
+        st.caption(
+            f"{len(all_opts):,} NSE stocks — start typing to search. "
+            "Your watchlist is at the top."
+        )
+    else:
+        chart_names = {}
+        all_opts = sorted(set(list(tickers) + list(st.session_state.get("shortlist", []))))
+        st.caption("NSE symbol list unavailable — showing your watchlist only.")
+
+    def chart_label(t):
+        if t in name_by_ticker:
+            return name_by_ticker[t]
+        base = t.replace(".NS", "")
+        name = chart_names.get(base)
+        return f"{name} ({base})" if name else base
+
     if not all_opts:
-        st.caption("Add stocks to your watchlist to use this.")
+        st.caption("No stocks available.")
     else:
         pick = st.selectbox("Stock", all_opts, key="chart_pick",
-                            format_func=lambda t: name_by_ticker.get(t, t))
+                            format_func=chart_label)
         with st.spinner("Reading the chart…"):
             ca = load_chart_analysis(pick)
 
