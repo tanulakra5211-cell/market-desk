@@ -1043,6 +1043,144 @@ def compute_market_technicals(hist: pd.DataFrame) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
+# ============================================== STORED HISTORY & BACKTEST ====
+# collect.py writes one gzipped CSV per month into data/history/. Reading from
+# disk costs milliseconds instead of hundreds of NSE requests, and it makes
+# testing a screen against a past date possible at all.
+
+HISTORY_DIR = Path(__file__).parent / "data" / "history"
+
+
+def load_stored_history() -> pd.DataFrame:
+    """Everything the collector has gathered so far."""
+    if not HISTORY_DIR.exists():
+        return pd.DataFrame()
+    files = sorted(HISTORY_DIR.glob("*.csv.gz"))
+    if not files:
+        return pd.DataFrame()
+
+    frames = []
+    for f in files:
+        try:
+            frames.append(pd.read_csv(f))
+        except Exception:
+            continue
+    if not frames:
+        return pd.DataFrame()
+
+    df = pd.concat(frames, ignore_index=True)
+    df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
+    return df.dropna(subset=["DATE"]).sort_values(["DATE", "SYMBOL"])
+
+
+def snapshot_at(hist: pd.DataFrame, as_of, lookback: int = 60) -> pd.DataFrame:
+    """
+    What every stock looked like on `as_of`, using only data available then.
+    No forward-looking fields -- that is the whole point.
+    """
+    window = hist[hist["DATE"] <= pd.Timestamp(as_of)]
+    if window.empty:
+        return pd.DataFrame()
+
+    dates = sorted(window["DATE"].unique())[-lookback:]
+    window = window[window["DATE"].isin(dates)]
+
+    closes = window.pivot_table(index="DATE", columns="SYMBOL",
+                                values="CLOSE", aggfunc="last").sort_index()
+    vols = window.pivot_table(index="DATE", columns="SYMBOL",
+                              values="VOLUME", aggfunc="last").sort_index()
+    deliv = window.pivot_table(index="DATE", columns="SYMBOL",
+                               values="DELIV_PER", aggfunc="last").sort_index()
+
+    n = len(closes)
+    last = closes.iloc[-1]
+
+    delta = closes.diff()
+    gain = delta.clip(lower=0).rolling(14).mean().iloc[-1]
+    loss = (-delta.clip(upper=0)).rolling(14).mean().iloc[-1]
+    rsi = 100 - (100 / (1 + gain / loss.replace(0, float("nan"))))
+    rsi = rsi.where(loss != 0, 100.0)
+
+    turnover = window[window["DATE"] == dates[-1]].set_index("SYMBOL")["TURNOVER_LACS"]
+
+    snap = pd.DataFrame({
+        "Symbol": last.index,
+        "Close": last.values,
+        "RSI (14)": rsi.reindex(last.index).values,
+        "Turnover (Cr)": (turnover.reindex(last.index) / 100).values,
+        "Delivery %": deliv.tail(5).mean().reindex(last.index).values,
+    })
+
+    if n >= 20:
+        sma20 = closes.rolling(20).mean().iloc[-1]
+        snap["vs 20DMA %"] = (((last - sma20) / sma20) * 100).reindex(last.index).values
+        avg_vol = vols.rolling(20).mean().iloc[-1]
+        snap["Vol vs 20d"] = (vols.iloc[-1] / avg_vol).reindex(last.index).values
+        snap["Delivery trend"] = (
+            deliv.tail(5).mean() - deliv.tail(20).mean()
+        ).reindex(last.index).values
+    if n >= 50:
+        sma50 = closes.rolling(50).mean().iloc[-1]
+        snap["vs 50DMA %"] = (((last - sma50) / sma50) * 100).reindex(last.index).values
+    if n > 21:
+        base = closes.iloc[-22]
+        snap["1M %"] = (((last - base) / base) * 100).reindex(last.index).values
+
+    return snap.reset_index(drop=True)
+
+
+def forward_returns(hist: pd.DataFrame, symbols: list, start, end) -> pd.DataFrame:
+    """
+    What happened next.
+
+    Stocks that stopped trading are reported as such rather than dropped.
+    Dropping them is the mechanism by which backtests flatter themselves.
+    """
+    window = hist[(hist["DATE"] >= pd.Timestamp(start)) & (hist["DATE"] <= pd.Timestamp(end))]
+    if window.empty:
+        return pd.DataFrame()
+
+    first = window.sort_values("DATE").groupby("SYMBOL").first()["CLOSE"]
+    last = window.sort_values("DATE").groupby("SYMBOL").last()["CLOSE"]
+    peak = window.groupby("SYMBOL")["CLOSE"].max()
+    trough = window.groupby("SYMBOL")["CLOSE"].min()
+    last_seen = window.groupby("SYMBOL")["DATE"].max()
+
+    final_date = window["DATE"].max()
+    rows = []
+    for s in symbols:
+        if s not in first.index:
+            rows.append({"Symbol": s, "Return %": float("nan"),
+                         "Status": "no data at entry"})
+            continue
+        still = last_seen[s] >= final_date - pd.Timedelta(days=7)
+        rows.append({
+            "Symbol": s,
+            "Entry": float(first[s]),
+            "Exit": float(last[s]),
+            "Return %": ((last[s] - first[s]) / first[s]) * 100,
+            "Peak gain %": ((peak[s] - first[s]) / first[s]) * 100,
+            "Max drawdown %": ((trough[s] - first[s]) / first[s]) * 100,
+            "Status": "trading" if still else f"stopped {last_seen[s]:%d %b %Y}",
+        })
+    return pd.DataFrame(rows)
+
+
+def benchmark_return(hist: pd.DataFrame, start, end) -> float:
+    """
+    Median return of every stock that traded over the window.
+
+    This is the honest bar: not whether your screen made money, but whether it
+    beat picking at random from the same universe.
+    """
+    window = hist[(hist["DATE"] >= pd.Timestamp(start)) & (hist["DATE"] <= pd.Timestamp(end))]
+    if window.empty:
+        return float("nan")
+    first = window.sort_values("DATE").groupby("SYMBOL").first()["CLOSE"]
+    last = window.sort_values("DATE").groupby("SYMBOL").last()["CLOSE"]
+    return float((((last - first) / first) * 100).median())
+
+
 # ============================================================== STYLING ======
 
 st.markdown(
@@ -1110,6 +1248,11 @@ def load_flows():
 @st.cache_data(ttl=3600)
 def load_fno_oi():
     return fetch_fno_participant_oi()
+
+
+@st.cache_data(ttl=1800)
+def cached_history():
+    return load_stored_history()
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -1257,10 +1400,10 @@ st.markdown(f'<div class="pulse-strip">{"".join(cells)}</div>', unsafe_allow_htm
 
 # ================================================================= TABS ======
 
-(tab_market, tab_screen, tab_tech, tab_hunt, tab_news, tab_flows,
+(tab_market, tab_screen, tab_tech, tab_hunt, tab_test, tab_news, tab_flows,
  tab_ratios, tab_book, tab_depth) = st.tabs(
-    ["Markets", "Screener (all NSE)", "Technicals", "Small-cap hunt", "News",
-     "FII / DII", "Ratios", "Order Book", "Depth"]
+    ["Markets", "Screener (all NSE)", "Technicals", "Small-cap hunt", "Backtest",
+     "News", "FII / DII", "Ratios", "Order Book", "Depth"]
 )
 
 with tab_market:
@@ -1644,6 +1787,167 @@ with tab_hunt:
                 'putting money behind anything here.</div>',
                 unsafe_allow_html=True,
             )
+
+
+with tab_test:
+    st.markdown("#### Backtest a screen")
+    st.markdown(
+        "Apply your filters to the market **as it looked on a past date**, then "
+        "show what every selected name actually did afterwards. Losers included, "
+        "delisted names flagged rather than dropped."
+    )
+
+    hist = cached_history()
+
+    if hist.empty:
+        st.markdown(
+            '<div class="stale">No stored history yet. This tab needs '
+            '<code>collect.py</code> to have run at least once — see the setup note '
+            'below. Nothing else in the app depends on it.</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            """
+            **To start collecting:** the repo includes a GitHub Action that runs
+            every weekday at 19:30 IST, fetches that day's bhavcopy and commits it.
+            Go to your repo's **Actions** tab, pick *Collect bhavcopy*, click
+            **Run workflow**, and enter `400` in the backfill box to seed roughly
+            a year and a half of history in one go. After that it maintains itself.
+            """
+        )
+    else:
+        dates = sorted(hist["DATE"].unique())
+        span_days = (dates[-1] - dates[0]).days
+        st.caption(
+            f"{len(dates)} trading days stored · "
+            f"{dates[0]:%d %b %Y} to {dates[-1]:%d %b %Y} · "
+            f"{hist['SYMBOL'].nunique():,} distinct symbols"
+        )
+
+        if span_days < 90:
+            st.warning(
+                f"Only {span_days} days of history. Results below will be noise "
+                "until you have at least a year — run the backfill."
+            )
+
+        d1, d2 = st.columns(2)
+        as_of = d1.date_input(
+            "Screen as of", value=dates[max(0, len(dates) - 130)].date(),
+            min_value=dates[0].date(), max_value=dates[-1].date(),
+        )
+        end_on = d2.date_input(
+            "Measure returns to", value=dates[-1].date(),
+            min_value=dates[0].date(), max_value=dates[-1].date(),
+        )
+
+        if pd.Timestamp(end_on) <= pd.Timestamp(as_of):
+            st.error("The end date must be after the screening date.")
+        else:
+            with st.spinner("Rebuilding the market as of that date…"):
+                snap = snapshot_at(hist, as_of)
+
+            if snap.empty:
+                st.warning("Not enough history before that date. Pick a later one.")
+            else:
+                st.markdown("**Screen criteria** — as they would have been applied then")
+                c1, c2, c3 = st.columns(3)
+                bt_px = c1.number_input("Max price", value=200.0, step=25.0, key="bt_px")
+                bt_turn = c2.number_input("Min turnover (Cr)", value=1.0, step=0.5, key="bt_turn")
+                bt_deliv = c3.number_input("Min delivery %", value=40.0, step=5.0, key="bt_deliv")
+
+                c4, c5, c6 = st.columns(3)
+                bt_rsi_lo = c4.number_input("RSI min", value=0.0, step=5.0, key="bt_rlo")
+                bt_rsi_hi = c5.number_input("RSI max", value=100.0, step=5.0, key="bt_rhi")
+                bt_vol = c6.number_input("Min vol vs 20d", value=0.0, step=0.5, key="bt_vol")
+
+                bt_above50 = st.checkbox("Only above 50DMA", key="bt_50")
+
+                sel = snap.copy()
+                sel = sel[sel["Close"].fillna(1e9) <= bt_px]
+                sel = sel[sel["Turnover (Cr)"].fillna(0) >= bt_turn]
+                if bt_deliv > 0 and "Delivery %" in sel.columns:
+                    sel = sel[sel["Delivery %"].fillna(0) >= bt_deliv]
+                sel = sel[sel["RSI (14)"].fillna(-1).between(bt_rsi_lo, bt_rsi_hi)]
+                if bt_vol > 0 and "Vol vs 20d" in sel.columns:
+                    sel = sel[sel["Vol vs 20d"].fillna(0) >= bt_vol]
+                if bt_above50 and "vs 50DMA %" in sel.columns:
+                    sel = sel[sel["vs 50DMA %"].fillna(-1e9) > 0]
+
+                st.caption(f"{len(sel):,} stocks would have been selected on {as_of:%d %b %Y}.")
+
+                if sel.empty:
+                    st.info("No stocks matched. Loosen the filters.")
+                elif len(sel) > 400:
+                    st.warning(
+                        f"{len(sel):,} names is too broad to be a screen — you are "
+                        "holding most of the market. Tighten the filters."
+                    )
+                else:
+                    fwd = forward_returns(hist, sel["Symbol"].tolist(), as_of, end_on)
+                    bench = benchmark_return(hist, as_of, end_on)
+                    valid = fwd["Return %"].dropna()
+
+                    if valid.empty:
+                        st.warning("No forward data for these names.")
+                    else:
+                        st.divider()
+                        st.markdown("**What actually happened**")
+
+                        m1, m2, m3, m4 = st.columns(4)
+                        m1.metric("Median return", f"{valid.median():+.1f}%",
+                                  delta=f"{valid.median() - bench:+.1f}% vs market",
+                                  help="The market bar is the median return of every "
+                                       "stock that traded over the same window.")
+                        m2.metric("Hit rate", f"{(valid > 0).mean():.0%}",
+                                  help="Share that finished positive.")
+                        m3.metric("Beat market", f"{(valid > bench).mean():.0%}")
+                        m4.metric("Mean return", f"{valid.mean():+.1f}%",
+                                  help="Skewed by outliers — compare against the median.")
+
+                        n1, n2, n3, n4 = st.columns(4)
+                        n1.metric("Doubled or better", f"{int((valid >= 100).sum())}")
+                        n2.metric("Lost half or more", f"{int((valid <= -50).sum())}")
+                        n3.metric("Best", f"{valid.max():+.0f}%")
+                        n4.metric("Worst", f"{valid.min():+.0f}%")
+
+                        stopped = fwd[fwd["Status"].astype(str).str.startswith("stopped")]
+                        if len(stopped):
+                            st.markdown(
+                                f'<div class="stale">{len(stopped)} of these stopped '
+                                'trading before the end date — suspension, delisting or '
+                                'illiquidity. Their last printed price is used, which '
+                                '<b>overstates</b> the result, since a suspended stock '
+                                'is rarely sellable at its final quote.</div>',
+                                unsafe_allow_html=True,
+                            )
+
+                        st.markdown(
+                            f"Median stock in the whole market over the same period: "
+                            f"**{bench:+.1f}%**. If your screen's median is not "
+                            "meaningfully above that, the filters are not adding "
+                            "anything beyond market direction."
+                        )
+
+                        st.dataframe(
+                            colour_frame(
+                                fwd.sort_values("Return %", ascending=False),
+                                ["Return %", "Peak gain %", "Max drawdown %"]),
+                            use_container_width=True, height=400, hide_index=True,
+                        )
+                        st.download_button(
+                            "Download results",
+                            data=fwd.to_csv(index=False).encode("utf-8"),
+                            file_name=f"backtest_{as_of}_{end_on}.csv", mime="text/csv")
+
+                        st.caption(
+                            "**Peak gain** and **max drawdown** matter as much as the "
+                            "final return: a name that ended +40% after being -60% "
+                            "along the way is not one most people would have held. "
+                            "One caveat this cannot fix — the store only contains "
+                            "dates you have collected, so a screen tested over a "
+                            "single market regime tells you about that regime, not "
+                            "about the screen."
+                        )
 
 
 with tab_news:
