@@ -30,7 +30,7 @@ st.set_page_config(
 )
 
 DATA_DIR = Path(__file__).parent / "data"
-APP_VERSION = "v8"
+APP_VERSION = "v9 — disk-first"
 
 
 # ============================================================ DEFAULT DATA ===
@@ -1590,6 +1590,79 @@ def scan_market_patterns(hist: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+# ============================================ DISK-FIRST MARKET DATA =========
+# NSE rate-limits this app's host, but the GitHub Action collector reaches it
+# fine. So stored history is the PRIMARY source and live NSE is the fallback,
+# not the other way round. Everything below reads from disk in milliseconds.
+
+def history_to_bhav_schema(hist: pd.DataFrame) -> pd.DataFrame:
+    """Rename stored columns to the bhavcopy names the analytics expect."""
+    if hist.empty:
+        return hist
+    return hist.rename(columns={
+        "DATE": "TRADE_DATE", "CLOSE": "CLOSE_PRICE",
+        "VOLUME": "TTL_TRD_QNTY",
+    })
+
+
+def screen_from_history(hist: pd.DataFrame):
+    """
+    The whole-market screener table, built from the newest stored day.
+    Returns (screen, date) or (empty, None).
+    """
+    if hist.empty:
+        return pd.DataFrame(), None
+
+    latest_date = hist["DATE"].max()
+    day = hist[hist["DATE"] == latest_date]
+    if day.empty:
+        return pd.DataFrame(), None
+
+    out = pd.DataFrame({
+        "Symbol": day["SYMBOL"].values,
+        "Close": day["CLOSE"].values,
+        "Day %": (((day["CLOSE"] - day["PREV_CLOSE"]) / day["PREV_CLOSE"]) * 100).values
+        if "PREV_CLOSE" in day.columns else float("nan"),
+        "Volume": day["VOLUME"].values if "VOLUME" in day.columns else float("nan"),
+        "Turnover (Cr)": (day["TURNOVER_LACS"] / 100).values
+        if "TURNOVER_LACS" in day.columns else float("nan"),
+        "Delivery %": day["DELIV_PER"].values if "DELIV_PER" in day.columns else float("nan"),
+    })
+
+    # 1-month change against the closest stored date ~21 sessions back
+    dates = sorted(hist["DATE"].unique())
+    if len(dates) > 21:
+        base_date = dates[-22]
+        base = hist[hist["DATE"] == base_date].set_index("SYMBOL")["CLOSE"]
+        out["1M %"] = ((out["Close"].values - base.reindex(out["Symbol"]).values)
+                       / base.reindex(out["Symbol"]).values) * 100
+
+    return out.reset_index(drop=True), pd.Timestamp(latest_date).date()
+
+
+def technicals_from_history(hist: pd.DataFrame):
+    """Whole-market technicals off stored history — no network at all."""
+    if hist.empty:
+        return pd.DataFrame(), 0
+    bhav = history_to_bhav_schema(hist)
+    return compute_market_technicals(bhav), bhav["TRADE_DATE"].nunique()
+
+
+FLOWS_PATH = Path(__file__).parent / "data" / "flows.csv"
+
+
+def load_stored_flows() -> pd.DataFrame:
+    """FII/DII history written by the collector."""
+    if not FLOWS_PATH.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(FLOWS_PATH, skipinitialspace=True)
+        df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
+        return df.dropna(subset=["DATE"]).sort_values("DATE")
+    except Exception:
+        return pd.DataFrame()
+
+
 @st.cache_data(ttl=3600)
 def symbol_universe() -> pd.DataFrame:
     """
@@ -1682,7 +1755,22 @@ def load_announcements(days: int, scrip: str):
 
 @st.cache_data(ttl=1800)
 def load_flows():
-    return fetch_fii_dii_cash()
+    """Live NSE if it answers, otherwise the collector's stored history."""
+    live = fetch_fii_dii_cash()
+    if not live.empty:
+        return live
+
+    stored = load_stored_flows()
+    if stored.empty:
+        return pd.DataFrame()
+    latest = stored[stored["DATE"] == stored["DATE"].max()]
+    return pd.DataFrame({
+        "Date": latest["DATE"].dt.strftime("%d-%b-%Y"),
+        "Participant": latest["PARTICIPANT"],
+        "Buy (Cr)": latest["BUY_CR"],
+        "Sell (Cr)": latest["SELL_CR"],
+        "Net (Cr)": latest["BUY_CR"] - latest["SELL_CR"],
+    }).reset_index(drop=True)
 
 
 @st.cache_data(ttl=3600)
@@ -1702,6 +1790,13 @@ def cached_history():
 
 @st.cache_data(ttl=21600, show_spinner=False)
 def load_market_technicals(calendar_days: int):
+    """Stored history first — it needs no network and is far faster."""
+    stored = load_stored_history()
+    if not stored.empty:
+        tech, days = technicals_from_history(stored)
+        if not tech.empty:
+            return tech, days
+
     hist = fetch_bhav_history(calendar_days)
     if hist.empty:
         return pd.DataFrame(), 0
@@ -1725,8 +1820,29 @@ def load_universe():
 
 @st.cache_data(ttl=3600)
 def load_market_screen():
-    """Whole-market table, the date it represents, and the fetch attempt log."""
+    """
+    Whole-market table, its date, and a log of what was tried.
+
+    Stored history first: it is instant and does not depend on NSE answering.
+    Only if the store is empty do we ask NSE directly.
+    """
+    stored = load_stored_history()
+    if not stored.empty:
+        screen, date = screen_from_history(stored)
+        if not screen.empty:
+            log = [("stored history", f"{stored['DATE'].nunique()} days on disk",
+                    f"latest {date}")]
+            uni = load_universe()
+            if not uni.empty:
+                screen = screen.merge(uni[["Symbol", "Company"]],
+                                      on="Symbol", how="left")
+                cols = ["Symbol", "Company"] + [c for c in screen.columns
+                                                if c not in ("Symbol", "Company")]
+                screen = screen[cols]
+            return screen, date, log
+
     latest, latest_date, attempts = fetch_latest_bhavcopy()
+    attempts.insert(0, ("stored history", "empty", "falling back to live NSE"))
     if latest.empty:
         return pd.DataFrame(), None, attempts
 
