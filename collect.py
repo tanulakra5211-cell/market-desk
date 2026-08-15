@@ -157,6 +157,63 @@ def fetch_day(client: httpx.Client, date: datetime, diag: list) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+
+FLOWS_PATH = Path(__file__).parent / "data" / "flows.csv"
+
+
+def collect_flows(client: httpx.Client) -> bool:
+    """
+    Daily FII/DII cash-market activity.
+
+    The app's host is rate-limited by NSE, so this has to be gathered here and
+    committed, same as the bhavcopy. Appends to data/flows.csv, skipping dates
+    already present.
+    """
+    try:
+        resp = client.get(f"{NSE_BASE}/api/fiidiiTradeReact")
+        if resp.status_code != 200:
+            print(f"  flows: HTTP {resp.status_code}")
+            return False
+        data = resp.json()
+    except Exception as exc:  # noqa: BLE001
+        print(f"  flows: {type(exc).__name__}: {str(exc)[:80]}")
+        return False
+
+    rows = []
+    for item in data or []:
+        try:
+            rows.append({
+                "DATE": pd.to_datetime(item.get("date"), dayfirst=True,
+                                       errors="coerce").strftime("%Y-%m-%d"),
+                "PARTICIPANT": str(item.get("category", "")).strip(),
+                "BUY_CR": float(item.get("buyValue", 0) or 0),
+                "SELL_CR": float(item.get("sellValue", 0) or 0),
+            })
+        except Exception:
+            continue
+
+    if not rows:
+        print("  flows: nothing parseable returned")
+        return False
+
+    new = pd.DataFrame(rows).dropna(subset=["DATE"])
+    FLOWS_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    if FLOWS_PATH.exists():
+        prev = pd.read_csv(FLOWS_PATH, skipinitialspace=True)
+        combined = pd.concat([prev, new], ignore_index=True)
+        combined = combined.drop_duplicates(subset=["DATE", "PARTICIPANT"],
+                                            keep="last")
+    else:
+        combined = new
+
+    combined = combined.sort_values(["DATE", "PARTICIPANT"])
+    combined.to_csv(FLOWS_PATH, index=False)
+    print(f"  flows: {len(new)} row(s) for {new['DATE'].iloc[0]} "
+          f"({len(combined)} total on file)")
+    return True
+
+
 def month_path(date_str: str) -> Path:
     return HISTORY_DIR / f"{date_str[:7]}.csv.gz"
 
@@ -222,8 +279,11 @@ def main() -> int:
     days = [d for d in days if d.strftime("%Y-%m-%d") not in have]
 
     if not days:
-        print(f"Already up to date — {len(have)} trading days already stored, "
-              "nothing new to fetch.")
+        print(f"Already up to date — {len(have)} trading days already stored.")
+        print("\nCollecting FII/DII flows…")
+        client = make_client()
+        collect_flows(client)
+        client.close()
         return 0
 
     if have:
@@ -283,6 +343,11 @@ def main() -> int:
             break
 
         time.sleep(0.4)  # stay under NSE's ~3 req/sec limit
+
+    # FII/DII is a single request and worth doing on every run, including runs
+    # where every bhavcopy date was already on disk.
+    print("\nCollecting FII/DII flows…")
+    collect_flows(client)
 
     client.close()
 
