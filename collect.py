@@ -78,30 +78,48 @@ def fetch_day(client: httpx.Client, date: datetime, diag: list) -> pd.DataFrame:
     try:
         resp = client.get(url, headers=archive_headers)
         diag.append(resp.status_code)
-        if resp.status_code == 200 and len(resp.content) < 500:
-            # NSE answers 200 with a stub for dates outside its retention window.
-            diag.append(f"200-but-{len(resp.content)}B: "
-                        f"{resp.content[:120]!r}")
-        if resp.status_code == 200 and not resp.content[:20].lstrip().lower().startswith(b"<"):
-            df = pd.read_csv(io.StringIO(resp.text))
+
+        if resp.status_code == 200:
+            body = resp.text
+            # Always sample on a 200 -- if parsing fails we need to see why,
+            # and guessing has already cost several rounds.
+            sample = body[:220].replace("\n", " | ").replace("\r", "")
+            diag.append(f"{len(body)}B head={sample!r}")
+
+            df = pd.read_csv(io.StringIO(body), skipinitialspace=True)
             df.columns = [c.strip() for c in df.columns]
+            diag.append(f"parsed {len(df)}r cols={list(df.columns)[:16]}")
+
             for c in df.columns:
-                if df[c].dtype == object:
+                if not pd.api.types.is_numeric_dtype(df[c]):
                     df[c] = df[c].astype(str).str.strip()
-            df = df[df["SERIES"].str.upper() == "EQ"] if "SERIES" in df.columns else df
+
+            if "SERIES" in df.columns:
+                before = len(df)
+                df = df[df["SERIES"].str.upper() == "EQ"]
+                diag.append(f"EQ filter {before}->{len(df)}")
+
+            if "SYMBOL" not in df.columns or "CLOSE_PRICE" not in df.columns:
+                diag.append(f"MISSING cols, have={list(df.columns)}")
+                return pd.DataFrame()
+
             out = pd.DataFrame({
                 "DATE": date.strftime("%Y-%m-%d"),
                 "SYMBOL": df["SYMBOL"],
-                "CLOSE": pd.to_numeric(df.get("CLOSE_PRICE"), errors="coerce"),
+                "CLOSE": pd.to_numeric(df["CLOSE_PRICE"], errors="coerce"),
                 "PREV_CLOSE": pd.to_numeric(df.get("PREV_CLOSE"), errors="coerce"),
                 "VOLUME": pd.to_numeric(df.get("TTL_TRD_QNTY"), errors="coerce"),
                 "TURNOVER_LACS": pd.to_numeric(df.get("TURNOVER_LACS"), errors="coerce"),
                 "DELIV_QTY": pd.to_numeric(df.get("DELIV_QTY"), errors="coerce"),
                 "DELIV_PER": pd.to_numeric(df.get("DELIV_PER"), errors="coerce"),
             })
-            return out.dropna(subset=["CLOSE"])
+            before = len(out)
+            out = out.dropna(subset=["CLOSE"])
+            diag.append(f"dropna CLOSE {before}->{len(out)}")
+            if not out.empty:
+                return out
     except Exception as exc:  # noqa: BLE001
-        print(f"    sec file failed: {exc}", file=sys.stderr)
+        diag.append(f"EXC {type(exc).__name__}: {str(exc)[:120]}")
 
     # Fallback: UDiFF zip. No delivery data, but better than a gap.
     url = UDIFF_URL.format(yyyymmdd=date.strftime("%Y%m%d"))
@@ -111,7 +129,7 @@ def fetch_day(client: httpx.Client, date: datetime, diag: list) -> pd.DataFrame:
         if resp.status_code != 200:
             return pd.DataFrame()
         with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-            raw = pd.read_csv(zf.open(zf.namelist()[0]))
+            raw = pd.read_csv(zf.open(zf.namelist()[0]), skipinitialspace=True)
         raw.columns = [c.strip() for c in raw.columns]
         raw = raw[raw.get("FinInstrmTp", "STK") == "STK"]
         if "SctySrs" in raw.columns:
@@ -144,7 +162,7 @@ def existing_dates() -> set:
         return dates
     for f in HISTORY_DIR.glob("*.csv.gz"):
         try:
-            dates.update(pd.read_csv(f, usecols=["DATE"])["DATE"].unique())
+            dates.update(pd.read_csv(f, usecols=["DATE"], skipinitialspace=True)["DATE"].unique())
         except Exception:
             continue
     return dates
@@ -159,7 +177,7 @@ def store(df: pd.DataFrame) -> None:
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
 
     if path.exists():
-        prev = pd.read_csv(path)
+        prev = pd.read_csv(path, skipinitialspace=True)
         prev = prev[prev["DATE"] != date_str]
         df = pd.concat([prev, df], ignore_index=True)
 
@@ -205,12 +223,16 @@ def main() -> int:
         label = day.strftime("%Y-%m-%d")
         diag: list = []
         df = fetch_day(client, day, diag)
+        if failed >= 3 and df.empty:
+            diag = [d for d in diag if isinstance(d, int)]
         for code in diag:
             key = code if isinstance(code, int) else str(code)[:40]
             statuses[key] = statuses.get(key, 0) + 1
 
         if df.empty:
-            print(f"  {label}: no data (HTTP {diag or 'error'})")
+            print(f"  {label}: no data")
+            for step in diag:
+                print(f"      {step}")
             failed += 1
             consecutive_misses += 1
             # Re-prime the session periodically -- cookies expire mid-run.
