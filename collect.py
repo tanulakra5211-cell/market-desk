@@ -51,8 +51,8 @@ HEADERS = {
     "Referer": f"{NSE_BASE}/",
 }
 
-KEEP = ["DATE", "SYMBOL", "CLOSE", "PREV_CLOSE", "VOLUME",
-        "TURNOVER_LACS", "DELIV_QTY", "DELIV_PER"]
+KEEP = ["DATE", "SYMBOL", "OPEN", "HIGH", "LOW", "CLOSE", "PREV_CLOSE",
+        "VOLUME", "TURNOVER_LACS", "DELIV_QTY", "DELIV_PER"]
 
 
 def make_client() -> httpx.Client:
@@ -106,6 +106,9 @@ def fetch_day(client: httpx.Client, date: datetime, diag: list) -> pd.DataFrame:
             out = pd.DataFrame({
                 "DATE": date.strftime("%Y-%m-%d"),
                 "SYMBOL": df["SYMBOL"],
+                "OPEN": pd.to_numeric(df.get("OPEN_PRICE"), errors="coerce"),
+                "HIGH": pd.to_numeric(df.get("HIGH_PRICE"), errors="coerce"),
+                "LOW": pd.to_numeric(df.get("LOW_PRICE"), errors="coerce"),
                 "CLOSE": pd.to_numeric(df["CLOSE_PRICE"], errors="coerce"),
                 "PREV_CLOSE": pd.to_numeric(df.get("PREV_CLOSE"), errors="coerce"),
                 "VOLUME": pd.to_numeric(df.get("TTL_TRD_QNTY"), errors="coerce"),
@@ -137,6 +140,9 @@ def fetch_day(client: httpx.Client, date: datetime, diag: list) -> pd.DataFrame:
         out = pd.DataFrame({
             "DATE": date.strftime("%Y-%m-%d"),
             "SYMBOL": raw["TckrSymb"],
+            "OPEN": pd.to_numeric(raw.get("OpnPric"), errors="coerce"),
+            "HIGH": pd.to_numeric(raw.get("HghPric"), errors="coerce"),
+            "LOW": pd.to_numeric(raw.get("LwPric"), errors="coerce"),
             "CLOSE": pd.to_numeric(raw["ClsPric"], errors="coerce"),
             "PREV_CLOSE": pd.to_numeric(raw["PrvsClsgPric"], errors="coerce"),
             "VOLUME": pd.to_numeric(raw["TtlTradgVol"], errors="coerce"),
@@ -181,6 +187,9 @@ def store(df: pd.DataFrame) -> None:
         prev = prev[prev["DATE"] != date_str]
         df = pd.concat([prev, df], ignore_index=True)
 
+    for col in KEEP:
+        if col not in df.columns:
+            df[col] = float("nan")
     df = df.sort_values(["DATE", "SYMBOL"])[KEEP]
     df.to_csv(path, index=False, compression="gzip")
 
@@ -191,6 +200,8 @@ def main() -> int:
                     help="Seed this many calendar days back from today")
     ap.add_argument("--from", dest="start", type=str, default="")
     ap.add_argument("--to", dest="end", type=str, default="")
+    ap.add_argument("--refresh", action="store_true",
+                    help="Re-fetch dates already stored (needed after a schema change)")
     args = ap.parse_args()
 
     if args.start and args.end:
@@ -203,7 +214,11 @@ def main() -> int:
         days = [datetime.now() - timedelta(days=i) for i in range(4)]
 
     days = [d for d in days if d.weekday() < 5]
-    have = existing_dates()
+    if args.refresh:
+        print("Refresh mode: re-fetching dates already on disk.")
+        have = set()
+    else:
+        have = existing_dates()
     days = [d for d in days if d.strftime("%Y-%m-%d") not in have]
 
     if not days:
