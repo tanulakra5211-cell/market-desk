@@ -10,7 +10,9 @@ Run locally:  streamlit run app.py
 
 import io
 import time
+import traceback
 import zipfile
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -1213,6 +1215,99 @@ st.markdown(
 )
 
 
+# ======================================================== CHART ANALYSIS =====
+# Support/resistance from actual swing points, and range projection from
+# realised volatility. Note what this is NOT: the range is a statement about
+# how much this stock typically moves, not a claim about direction. A wide
+# band means "size your position for this", not "it will reach the top".
+
+def analyse_chart(ticker: str) -> dict | None:
+    """Trend, momentum, levels and a volatility-based range for one stock."""
+    try:
+        hist = yf.Ticker(ticker).history(period="1y", interval="1d")
+    except Exception:
+        return None
+    if hist is None or len(hist) < 60:
+        return None
+
+    close = hist["Close"].dropna()
+    high, low = hist["High"], hist["Low"]
+    last = float(close.iloc[-1])
+
+    # Average True Range -- realised daily movement, the basis for the range
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs(),
+    ], axis=1).max(axis=1)
+    atr = float(tr.rolling(14).mean().iloc[-1])
+    atr_pct = (atr / last) * 100
+
+    sma20 = float(close.rolling(20).mean().iloc[-1])
+    sma50 = float(close.rolling(50).mean().iloc[-1])
+    sma200 = float(close.rolling(200).mean().iloc[-1]) if len(close) >= 200 else None
+
+    # Swing points: local extremes over a 5-day window
+    win = 5
+    highs = high.rolling(win * 2 + 1, center=True).max()
+    lows = low.rolling(win * 2 + 1, center=True).min()
+    swing_highs = sorted({round(float(v), 2) for v in high[(high == highs)].tail(40)})
+    swing_lows = sorted({round(float(v), 2) for v in low[(low == lows)].tail(40)})
+
+    resistance = [p for p in swing_highs if p > last][:3]
+    support = [p for p in swing_lows if p < last][-3:][::-1]
+
+    if sma200 and last > sma50 > sma200:
+        trend = "Uptrend — above both the 50 and 200 day averages"
+    elif sma200 and last < sma50 < sma200:
+        trend = "Downtrend — below both the 50 and 200 day averages"
+    elif last > sma20 and last > sma50:
+        trend = "Rising — above short and medium term averages"
+    elif last < sma20 and last < sma50:
+        trend = "Falling — below short and medium term averages"
+    else:
+        trend = "Sideways — averages are tangled, no clear direction"
+
+    # Range projection: ATR scaled by root-time. This is a volatility band,
+    # symmetric by construction, and deliberately makes no directional call.
+    def band(days: int) -> tuple:
+        move = atr * (days ** 0.5)
+        return round(last - move, 2), round(last + move, 2)
+
+    return {
+        "ticker": ticker,
+        "last": last,
+        "trend": trend,
+        "rsi": _rsi(close),
+        "atr": atr,
+        "atr_pct": atr_pct,
+        "sma20": sma20, "sma50": sma50, "sma200": sma200,
+        "support": support,
+        "resistance": resistance,
+        "range_1w": band(5),
+        "range_1m": band(21),
+        "hi52": float(close.max()), "lo52": float(close.min()),
+        "series": close.tail(120),
+    }
+
+
+@contextmanager
+def safe_tab(name: str):
+    """
+    Isolate a tab. Without this, an exception anywhere stops the script and
+    every tab further down silently renders blank -- which looks identical to
+    "no data" and is why the last three tabs appeared empty.
+    """
+    try:
+        yield
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"The {name} tab hit an error: {type(exc).__name__}: {exc}")
+        with st.expander("Details"):
+            st.code(traceback.format_exc())
+        st.caption("Other tabs are unaffected. Send me this message and I'll fix it.")
+
+
+
 # ========================================================= CACHED LOADERS ====
 
 @st.cache_data(ttl=300)
@@ -1261,6 +1356,11 @@ def load_market_technicals(calendar_days: int):
     if hist.empty:
         return pd.DataFrame(), 0
     return compute_market_technicals(hist), hist["TRADE_DATE"].nunique()
+
+
+@st.cache_data(ttl=900)
+def load_chart_analysis(ticker: str):
+    return analyse_chart(ticker)
 
 
 @st.cache_data(ttl=900)
@@ -1406,7 +1506,7 @@ st.markdown(f'<div class="pulse-strip">{"".join(cells)}</div>', unsafe_allow_htm
      "News", "FII / DII", "Ratios", "Order Book", "Depth"]
 )
 
-with tab_market:
+with tab_market, safe_tab("Markets"):
     left, right = st.columns(2)
 
     with left:
@@ -1438,7 +1538,7 @@ with tab_market:
             )
 
 
-with tab_screen:
+with tab_screen, safe_tab("Screener"):
     st.markdown("#### Whole-market screener")
     st.caption(
         "Every EQ-series stock on NSE, from the daily bhavcopy — one file, one "
@@ -1495,14 +1595,17 @@ with tab_screen:
                          use_container_width=True, hide_index=True)
 
         f1, f2, f3, f4 = st.columns(4)
-        min_turnover = f1.number_input("Min turnover (Cr)", value=5.0, step=1.0)
-        min_delivery = f2.number_input("Min delivery %", value=0.0, step=5.0)
-        min_price = f3.number_input("Min price", value=0.0, step=10.0)
-        max_price = f4.number_input("Max price (0 = no cap)", value=0.0, step=100.0)
+        min_turnover = f1.number_input("Min turnover (Cr)", value=5.0, step=1.0,
+                                       key="scr_turnover")
+        min_delivery = f2.number_input("Min delivery %", value=0.0, step=5.0,
+                                       key="scr_delivery")
+        min_price = f3.number_input("Min price", value=0.0, step=10.0, key="scr_minpx")
+        max_price = f4.number_input("Max price (0 = no cap)", value=0.0, step=100.0,
+                                    key="scr_maxpx")
 
         g1, g2 = st.columns(2)
-        move_min = g1.number_input("Min day % move", value=-100.0, step=1.0)
-        move_max = g2.number_input("Max day % move", value=100.0, step=1.0)
+        move_min = g1.number_input("Min day % move", value=-100.0, step=1.0, key="scr_movemin")
+        move_max = g2.number_input("Max day % move", value=100.0, step=1.0, key="scr_movemax")
 
         view = screen.copy()
         view = view[view["Turnover (Cr)"].fillna(0) >= min_turnover]
@@ -1517,7 +1620,7 @@ with tab_screen:
         sort_options = [c for c in ["Turnover (Cr)", "Day %", "1M %", "Delivery %",
                                     "Volume", "Close"] if c in view.columns]
         s1, s2 = st.columns([3, 1])
-        sort_by = s1.selectbox("Sort by", options=sort_options)
+        sort_by = s1.selectbox("Sort by", options=sort_options, key="scr_sort")
         descending = s2.checkbox("Descending", value=True)
         view = view.sort_values(sort_by, ascending=not descending, na_position="last")
 
@@ -1556,7 +1659,7 @@ with tab_screen:
             )
 
 
-with tab_tech:
+with tab_tech, safe_tab("Technicals"):
     st.markdown("#### Technical position")
     st.markdown(
         "Where each stock sits relative to its own moving averages, range and "
@@ -1602,13 +1705,14 @@ with tab_tech:
                 st.caption(f"{len(mkt_tech):,} stocks · {days_loaded} trading days of history")
 
                 t1, t2, t3 = st.columns(3)
-                rsi_lo = t1.number_input("RSI min", value=0.0, step=5.0)
-                rsi_hi = t2.number_input("RSI max", value=100.0, step=5.0)
-                min_vol_surge = t3.number_input("Min vol vs 20d avg", value=0.0, step=0.5)
+                rsi_lo = t1.number_input("RSI min", value=0.0, step=5.0, key="tech_rsilo")
+                rsi_hi = t2.number_input("RSI max", value=100.0, step=5.0, key="tech_rsihi")
+                min_vol_surge = t3.number_input("Min vol vs 20d avg", value=0.0, step=0.5,
+                                                key="tech_volsurge")
 
                 u1, u2 = st.columns(2)
-                above_50 = u1.checkbox("Only above 50DMA")
-                rising_deliv = u2.checkbox("Only rising delivery %")
+                above_50 = u1.checkbox("Only above 50DMA", key="tech_above50")
+                rising_deliv = u2.checkbox("Only rising delivery %", key="tech_deliv")
 
                 v = mkt_tech.copy()
                 v = v[v["RSI (14)"].fillna(-1).between(rsi_lo, rsi_hi)]
@@ -1620,7 +1724,7 @@ with tab_tech:
                     v = v[v["Delivery trend"].fillna(-1e9) > 0]
 
                 sortable = [c for c in v.columns if v[c].dtype.kind in "fi"]
-                sort_col = st.selectbox("Sort by", sortable,
+                sort_col = st.selectbox("Sort by", sortable, key="tech_sort",
                                         index=sortable.index("1M %") if "1M %" in sortable else 0)
                 v = v.sort_values(sort_col, ascending=False, na_position="last")
 
@@ -1674,8 +1778,70 @@ with tab_tech:
                 "Screener tab to tell accumulation from churn."
             )
 
+    st.divider()
+    st.markdown("#### Single stock chart read")
 
-with tab_hunt:
+    all_opts = sorted(set(list(tickers) + list(st.session_state.get("shortlist", []))))
+    if not all_opts:
+        st.caption("Add stocks to your watchlist to use this.")
+    else:
+        pick = st.selectbox("Stock", all_opts, key="chart_pick",
+                            format_func=lambda t: name_by_ticker.get(t, t))
+        with st.spinner("Reading the chart…"):
+            ca = load_chart_analysis(pick)
+
+        if ca is None:
+            st.info("Not enough price history for this symbol.")
+        else:
+            st.markdown(f"**{name_by_ticker.get(pick, pick)}** — Rs {ca['last']:,.2f}")
+            st.markdown(f"*{ca['trend']}.* RSI {ca['rsi']:.0f}. "
+                        f"Typical daily move {ca['atr_pct']:.1f}% "
+                        f"(ATR {ca['atr']:.2f}).")
+
+            k1, k2 = st.columns(2)
+            with k1:
+                st.markdown("**Support below**")
+                if ca["support"]:
+                    for lvl in ca["support"]:
+                        st.markdown(f"- Rs {lvl:,.2f}  ({((lvl / ca['last']) - 1) * 100:+.1f}%)")
+                else:
+                    st.caption("No prior swing low below — at or near 52-week lows.")
+            with k2:
+                st.markdown("**Resistance above**")
+                if ca["resistance"]:
+                    for lvl in ca["resistance"]:
+                        st.markdown(f"- Rs {lvl:,.2f}  ({((lvl / ca['last']) - 1) * 100:+.1f}%)")
+                else:
+                    st.caption("No prior swing high above — at or near 52-week highs.")
+
+            st.markdown("**Expected range from realised volatility**")
+            r1, r2 = st.columns(2)
+            r1.metric("Next week",
+                      f"{ca['range_1w'][0]:,.0f} – {ca['range_1w'][1]:,.0f}")
+            r2.metric("Next month",
+                      f"{ca['range_1m'][0]:,.0f} – {ca['range_1m'][1]:,.0f}")
+
+            st.markdown(
+                '<div class="stale"><b>Read these bands correctly.</b> They are '
+                'ATR scaled by the square root of time — a statement about how '
+                'much this stock typically moves, not where it is going. They are '
+                'symmetric by construction, so the upper figure is not a target '
+                'and the lower is not a prediction. Roughly two-thirds of one-month '
+                'outcomes land inside a band like this; the other third is what '
+                'position sizing is for. A single earnings release or order '
+                'announcement voids the whole calculation.</div>',
+                unsafe_allow_html=True,
+            )
+
+            st.line_chart(ca["series"], height=260)
+            st.caption(
+                f"120 days. 20DMA {ca['sma20']:,.0f} · 50DMA {ca['sma50']:,.0f}"
+                + (f" · 200DMA {ca['sma200']:,.0f}" if ca["sma200"] else "")
+                + f" · 52W range {ca['lo52']:,.0f}–{ca['hi52']:,.0f}"
+            )
+
+
+with tab_hunt, safe_tab("Small-cap hunt"):
     st.markdown("#### Small-cap factor screen")
 
     st.markdown(
@@ -1707,12 +1873,14 @@ with tab_hunt:
         st.info("Load the Screener tab first — this reuses the same market data.")
     else:
         h1, h2, h3 = st.columns(3)
-        px_max = h1.number_input("Max price", value=200.0, step=25.0,
+        px_max = h1.number_input("Max price", value=200.0, step=25.0, key="hunt_px",
                                  help="A low price is not a low valuation. This is "
                                       "only a crude proxy for a small company.")
         turn_min = h2.number_input("Min turnover (Cr)", value=1.0, step=0.5,
+                                   key="hunt_turnover",
                                    help="Below ~1 Cr you may not be able to exit.")
         deliv_min = h3.number_input("Min delivery %", value=40.0, step=5.0,
+                                    key="hunt_delivery",
                                     help="High delivery means buyers are holding, "
                                          "not day-trading.")
 
@@ -1742,10 +1910,10 @@ with tab_hunt:
                                max_selections=30, key="hunt_picks")
 
         c1, c2, c3, c4 = st.columns(4)
-        min_roce = c1.number_input("Min ROCE %", value=20.0, step=5.0)
-        max_de_h = c2.number_input("Max D/E", value=0.5, step=0.1)
-        min_growth = c3.number_input("Min rev growth %", value=20.0, step=5.0)
-        max_mcap = c4.number_input("Max mkt cap (Cr)", value=5000.0, step=500.0)
+        min_roce = c1.number_input("Min ROCE %", value=20.0, step=5.0, key="hunt_roce")
+        max_de_h = c2.number_input("Max D/E", value=0.5, step=0.1, key="hunt_de")
+        min_growth = c3.number_input("Min rev growth %", value=20.0, step=5.0, key="hunt_growth")
+        max_mcap = c4.number_input("Max mkt cap (Cr)", value=5000.0, step=500.0, key="hunt_mcap")
 
         if picks and st.button("Check fundamentals", type="primary", key="hunt_go"):
             bar = st.progress(0.0, text="Starting…")
@@ -1789,7 +1957,7 @@ with tab_hunt:
             )
 
 
-with tab_test:
+with tab_test, safe_tab("Backtest"):
     st.markdown("#### Backtest a screen")
     st.markdown(
         "Apply your filters to the market **as it looked on a past date**, then "
@@ -2033,7 +2201,7 @@ with tab_test:
                         )
 
 
-with tab_news:
+with tab_news, safe_tab("News"):
     col_a, col_b = st.columns([3, 2])
 
     with col_a:
@@ -2078,7 +2246,7 @@ with tab_news:
                          use_container_width=True, height=380, hide_index=True)
 
 
-with tab_flows:
+with tab_flows, safe_tab("FII/DII"):
     st.markdown("#### Institutional flows")
 
     if flows_df.empty:
@@ -2106,14 +2274,14 @@ with tab_flows:
         st.dataframe(oi, use_container_width=True, hide_index=True)
 
 
-with tab_ratios:
+with tab_ratios, safe_tab("Ratios"):
     st.markdown("#### Fundamentals")
     st.caption("Cached six hours — the source is rate-limited, so repeated refreshes "
                "will get you throttled.")
 
     shortlist = st.session_state.get("shortlist", [])
     source = st.radio(
-        "Source",
+        "Source", key="ratio_source",
         options=["Watchlist", "Screener shortlist"],
         horizontal=True,
         index=0,
@@ -2165,8 +2333,9 @@ with tab_ratios:
     else:
         c1, c2, c3 = st.columns(3)
         max_pe = c1.number_input("Max P/E", value=0.0, help="0 disables this filter")
-        min_roe = c2.number_input("Min ROE %", value=0.0)
-        max_de = c3.number_input("Max D/E", value=0.0, help="0 disables this filter")
+        min_roe = c2.number_input("Min ROE %", value=0.0, key="ratio_roe")
+        max_de = c3.number_input("Max D/E", value=0.0, key="ratio_de",
+                                 help="0 disables this filter")
 
         view = ratios.copy()
         if max_pe > 0:
@@ -2183,7 +2352,7 @@ with tab_ratios:
                    "on mid and small caps.")
 
 
-with tab_book:
+with tab_book, safe_tab("Order Book"):
     st.markdown("#### Order backlog")
     st.markdown(
         "Company order books are disclosed in quarterly investor presentations and "
@@ -2238,7 +2407,7 @@ with tab_book:
     )
 
 
-with tab_depth:
+with tab_depth, safe_tab("Depth"):
     st.markdown("#### Live market depth")
     provider = build_depth_provider()
 
