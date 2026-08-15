@@ -30,7 +30,7 @@ st.set_page_config(
 )
 
 DATA_DIR = Path(__file__).parent / "data"
-APP_VERSION = "v7 — patterns"
+APP_VERSION = "v8"
 
 
 # ============================================================ DEFAULT DATA ===
@@ -2153,6 +2153,9 @@ with tab_tech, safe_tab("Technicals"):
             "market is memory-heavy and would otherwise run on every click."
         )
     else:
+        if st.button("Hide scan", key="scan_hide"):
+            st.session_state["_run_scan"] = False
+            st.rerun()
         with st.spinner("Scanning the whole market…"):
             scan = cached_pattern_scan()
 
@@ -2342,27 +2345,30 @@ with tab_tech, safe_tab("Technicals"):
                 st.caption("No recognised patterns in the recent bars.")
 
             lo1m, hi1m = ca["range_1m"]
+
+            res_txt = (", ".join(f"Rs {x:,.0f}" for x in ca["resistance"][:2])
+                       or f"the 52-week high at Rs {ca['hi52']:,.0f}")
+            sup_txt = (", ".join(f"Rs {x:,.0f}" for x in ca["support"][:2])
+                       or f"the 52-week low at Rs {ca['lo52']:,.0f}")
+            invalidate_down = (f"Rs {ca['support'][0]:,.0f}" if ca["support"]
+                               else f"the 52-week low at Rs {ca['lo52']:,.0f}")
+            invalidate_up = (f"Rs {ca['resistance'][0]:,.0f}" if ca["resistance"]
+                             else f"the 52-week high at Rs {ca['hi52']:,.0f}")
+
             if verdict["tone"] == "up":
                 narrative = (
-                    f"Structure leans higher. If it holds, the levels that matter are "
-                    f"resistance at "
-                    f"{', '.join(f'Rs {x:,.0f}' for x in ca['resistance'][:2]) or 'the 52-week high'}. "
-                    f"The read fails if it loses "
-                    f"Rs {ca['support'][0]:,.0f}" if ca['support'] else "recent support"
+                    f"Structure leans higher. The levels that matter above are "
+                    f"{res_txt}. The read is wrong if it loses {invalidate_down}"
                 )
             elif verdict["tone"] == "down":
                 narrative = (
-                    f"Structure leans lower. Support to watch: "
-                    f"{', '.join(f'Rs {x:,.0f}' for x in ca['support'][:2]) or 'the 52-week low'}. "
-                    f"The read fails if it reclaims "
-                    f"Rs {ca['resistance'][0]:,.0f}" if ca['resistance'] else "recent resistance"
+                    f"Structure leans lower. Support to watch: {sup_txt}. "
+                    f"The read is wrong if it reclaims {invalidate_up}"
                 )
             else:
                 narrative = (
-                    f"No directional edge in the chart. It has been ranging between "
-                    f"Rs {ca['support'][0]:,.0f} and Rs {ca['resistance'][0]:,.0f}"
-                    if ca['support'] and ca['resistance']
-                    else "No directional edge in the chart"
+                    f"No directional edge in the chart. It has been ranging "
+                    f"roughly between {sup_txt} and {res_txt}"
                 )
 
             st.markdown(f"**One-month read.** {narrative}. "
@@ -2524,9 +2530,13 @@ with tab_test, safe_tab("Backtest"):
             unsafe_allow_html=True,
         )
         st.markdown(
-            "GitHub's servers are blocked by NSE, but **this app is not** — the "
-            "Screener and Technicals tabs are fetching successfully. So collect "
-            "the history here, download it, and commit it to your repo once."
+            "**The normal route is the GitHub Action.** In your repo, open the "
+            "**Actions** tab, choose *Collect bhavcopy*, click **Run workflow** and "
+            "enter a backfill of `400`. It commits the data straight to "
+            "`data/history/` and then runs itself every weekday at 19:30 IST.\n\n"
+            "If that has already run and this message is still showing, Streamlit "
+            "has not picked up the new files — use **Manage app → Reboot**.\n\n"
+            "The collector below is a manual fallback for when the Action fails."
         )
 
         st.divider()
@@ -2878,10 +2888,13 @@ with tab_ratios, safe_tab("Ratios"):
             )
 
     if ratios.empty:
-        st.info("No fundamental data returned.")
+        if not target:
+            st.info("Nothing selected — pick a source above.")
+        # otherwise the "click above to fetch" prompt already explains things
     else:
         c1, c2, c3 = st.columns(3)
-        max_pe = c1.number_input("Max P/E", value=0.0, help="0 disables this filter")
+        max_pe = c1.number_input("Max P/E", value=0.0, key="ratio_pe",
+                                 help="0 disables this filter")
         min_roe = c2.number_input("Min ROE %", value=0.0, key="ratio_roe")
         max_de = c3.number_input("Max D/E", value=0.0, key="ratio_de",
                                  help="0 disables this filter")
