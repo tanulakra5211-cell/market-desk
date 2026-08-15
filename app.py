@@ -30,7 +30,7 @@ st.set_page_config(
 )
 
 DATA_DIR = Path(__file__).parent / "data"
-APP_VERSION = "v9 — disk-first"
+APP_VERSION = "v10 — options"
 
 
 # ============================================================ DEFAULT DATA ===
@@ -1590,6 +1590,114 @@ def scan_market_patterns(hist: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+# =============================================================== OPTIONS =====
+# Payoff maths for arbitrary multi-leg positions. Everything here is exact
+# arithmetic on expiry values -- no model, no assumptions, no forecast. What
+# it cannot tell you is the probability of any outcome; it tells you what each
+# outcome pays.
+
+LOT_SIZES = {
+    "NIFTY": 75, "BANKNIFTY": 35, "FINNIFTY": 65, "MIDCPNIFTY": 140,
+    "RELIANCE": 500, "TCS": 175, "INFY": 400, "HDFCBANK": 550,
+    "ICICIBANK": 700, "SBIN": 750, "ITC": 1600, "LT": 150,
+    "BHARTIARTL": 475, "BEL": 2850, "HAL": 150,
+}
+
+
+def leg_payoff(spot, kind: str, strike: float, premium: float,
+               direction: str, qty: int):
+    """
+    Value of one leg at expiry, per the whole position (qty = lots x lot size).
+    kind: call | put | future.  direction: long | short.
+    """
+    import numpy as np
+    s = np.asarray(spot, dtype=float)
+
+    if kind == "call":
+        intrinsic = np.maximum(s - strike, 0.0)
+    elif kind == "put":
+        intrinsic = np.maximum(strike - s, 0.0)
+    else:  # future or stock -- premium field carries the entry price
+        intrinsic = s - premium
+        return (intrinsic if direction == "long" else -intrinsic) * qty
+
+    if direction == "long":
+        return (intrinsic - premium) * qty
+    return (premium - intrinsic) * qty
+
+
+def position_payoff(legs: list, spot_range):
+    """Total payoff across all legs over a range of expiry prices."""
+    import numpy as np
+    total = np.zeros(len(spot_range), dtype=float)
+    for lg in legs:
+        total = total + leg_payoff(
+            spot_range, lg["kind"], lg["strike"], lg["premium"],
+            lg["direction"], lg["qty"])
+    return total
+
+
+def analyse_position(legs: list, underlying: float):
+    """
+    Breakevens, max profit and max loss for a multi-leg position.
+
+    Unbounded outcomes are reported as unlimited rather than as the edge of
+    whatever price range happened to be sampled -- a naked short call does not
+    have a maximum loss, and rounding one in would be a dangerous fiction.
+    """
+    import numpy as np
+    if not legs:
+        return None
+
+    strikes = [lg["strike"] for lg in legs if lg["kind"] in ("call", "put")]
+    ref = max(strikes + [underlying])
+
+    # The grid starts at zero deliberately. A share cannot go below zero, so
+    # the downside is ALWAYS bounded -- its worst case is the value at S=0.
+    # Only the upside can be genuinely unlimited. Sampling from a non-zero
+    # floor would silently understate the loss on anything holding the
+    # underlying or short puts.
+    grid = np.linspace(0.0, ref * 2.0, 6000)
+    pay = position_payoff(legs, grid)
+
+    # Slope in the far right tail decides whether the upside is open, and in
+    # which direction.
+    right_slope = (pay[-1] - pay[-2]) / (grid[-1] - grid[-2])
+    unlimited_up = right_slope > 1e-6      # profit grows without bound
+    unlimited_loss = right_slope < -1e-6   # loss grows without bound
+
+    max_profit = float("inf") if unlimited_up else float(pay.max())
+    max_loss = float("-inf") if unlimited_loss else float(pay.min())
+    unlimited_down = unlimited_loss
+
+    # Breakevens: sign changes on the grid, refined by linear interpolation
+    breakevens = []
+    sign = np.sign(pay)
+    for i in range(len(grid) - 1):
+        if sign[i] == 0:
+            breakevens.append(float(grid[i]))
+        elif sign[i] * sign[i + 1] < 0:
+            x0, x1, y0, y1 = grid[i], grid[i + 1], pay[i], pay[i + 1]
+            breakevens.append(float(x0 - y0 * (x1 - x0) / (y1 - y0)))
+    breakevens = sorted({round(b, 2) for b in breakevens})
+
+    net_premium = sum(
+        (-lg["premium"] if lg["direction"] == "long" else lg["premium"]) * lg["qty"]
+        for lg in legs if lg["kind"] in ("call", "put")
+    )
+
+    return {
+        "grid": grid, "payoff": pay,
+        "max_profit": max_profit,
+        "max_loss": max_loss,
+        "unlimited_up": unlimited_up, "unlimited_down": unlimited_down,
+        "worst_at_zero": float(pay[0]),
+        "breakevens": breakevens,
+        "net_premium": net_premium,
+        "payoff_at_spot": float(np.interp(underlying, grid, pay)),
+    }
+
+
 # ============================================ DISK-FIRST MARKET DATA =========
 # NSE rate-limits this app's host, but the GitHub Action collector reaches it
 # fine. So stored history is the PRIMARY source and live NSE is the fallback,
@@ -1783,6 +1891,69 @@ def cached_pattern_scan():
     return scan_market_patterns(load_stored_history())
 
 
+OPTIONS_DIR = Path(__file__).parent / "data" / "options"
+IV_PATH = Path(__file__).parent / "data" / "iv_history.csv"
+
+
+@st.cache_data(ttl=1800)
+def load_iv_history() -> pd.DataFrame:
+    if not IV_PATH.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(IV_PATH, skipinitialspace=True)
+        df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
+        return df.dropna(subset=["DATE"]).sort_values("DATE")
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=1800)
+def load_latest_chain() -> pd.DataFrame:
+    """Most recent option chain snapshot the collector stored."""
+    if not OPTIONS_DIR.exists():
+        return pd.DataFrame()
+    files = sorted(OPTIONS_DIR.glob("*.csv.gz"))
+    if not files:
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(files[-1], skipinitialspace=True)
+        return df[df["DATE"] == df["DATE"].max()]
+    except Exception:
+        return pd.DataFrame()
+
+
+def iv_rank(series: pd.Series, current: float):
+    """
+    IV rank and percentile against the stock's own history.
+
+    Rank places today between the period low and high. Percentile is the share
+    of days that were lower. They disagree when the distribution is skewed,
+    which is exactly when it matters.
+    """
+    s = series.dropna()
+    if len(s) < 20 or pd.isna(current):
+        return None, None, len(s)
+    lo, hi = float(s.min()), float(s.max())
+    rank = ((current - lo) / (hi - lo)) * 100 if hi > lo else float("nan")
+    pctile = (s < current).mean() * 100
+    return rank, pctile, len(s)
+
+
+def classify_oi(price_chg, oi_chg):
+    """The standard four-way read of price against open interest."""
+    if pd.isna(price_chg) or pd.isna(oi_chg):
+        return "—"
+    if price_chg > 0 and oi_chg > 0:
+        return "Long buildup"
+    if price_chg < 0 and oi_chg > 0:
+        return "Short buildup"
+    if price_chg > 0 and oi_chg < 0:
+        return "Short covering"
+    if price_chg < 0 and oi_chg < 0:
+        return "Long unwinding"
+    return "—"
+
+
 @st.cache_data(ttl=1800)
 def cached_history():
     return load_stored_history()
@@ -1966,10 +2137,10 @@ st.markdown(f'<div class="pulse-strip">{"".join(cells)}</div>', unsafe_allow_htm
 
 # ================================================================= TABS ======
 
-(tab_market, tab_screen, tab_tech, tab_hunt, tab_test, tab_news, tab_flows,
- tab_ratios, tab_book, tab_depth) = st.tabs(
-    ["Markets", "Screener (all NSE)", "Technicals", "Small-cap hunt", "Backtest",
-     "News", "FII / DII", "Ratios", "Order Book", "Depth"]
+(tab_market, tab_screen, tab_tech, tab_opt, tab_hunt, tab_test, tab_news,
+ tab_flows, tab_ratios, tab_book, tab_depth) = st.tabs(
+    ["Markets", "Screener (all NSE)", "Technicals", "Options", "Small-cap hunt",
+     "Backtest", "News", "FII / DII", "Ratios", "Order Book", "Depth"]
 )
 
 with tab_market, safe_tab("Markets"):
@@ -2510,6 +2681,228 @@ with tab_tech, safe_tab("Technicals"):
                 + (f" · 200DMA {ca['sma200']:,.0f}" if ca["sma200"] else "")
                 + f" · 52W range {ca['lo52']:,.0f}–{ca['hi52']:,.0f}"
             )
+
+
+with tab_opt, safe_tab("Options"):
+    st.markdown("#### Options")
+
+    opt_view = st.radio("View", ["Payoff calculator", "Option chain", "IV rank"],
+                        horizontal=True, key="opt_view")
+
+    # ------------------------------------------------------------ payoff ---
+    if opt_view == "Payoff calculator":
+        st.caption(
+            "Exact arithmetic on expiry values — no model and no assumptions. "
+            "It tells you what each outcome pays, not how likely any of them is."
+        )
+
+        pc1, pc2 = st.columns([2, 1])
+        underlying_sym = pc1.selectbox(
+            "Underlying", options=list(LOT_SIZES.keys()), key="opt_sym")
+        lot = LOT_SIZES.get(underlying_sym, 1)
+        spot = pc2.number_input("Spot price", value=24366.0, step=50.0, key="opt_spot")
+        st.caption(f"Lot size {lot}. Quantities below are in lots.")
+
+        if "opt_legs" not in st.session_state:
+            st.session_state["opt_legs"] = pd.DataFrame([
+                {"Direction": "long", "Type": "call", "Strike": 24400.0,
+                 "Premium": 150.0, "Lots": 1},
+            ])
+
+        legs_df = st.data_editor(
+            st.session_state["opt_legs"], num_rows="dynamic",
+            use_container_width=True, key="opt_editor",
+            column_config={
+                "Direction": st.column_config.SelectboxColumn(
+                    options=["long", "short"], required=True),
+                "Type": st.column_config.SelectboxColumn(
+                    options=["call", "put", "future"], required=True,
+                    help="For a future leg, put your entry price in Premium."),
+                "Strike": st.column_config.NumberColumn(format="%.2f"),
+                "Premium": st.column_config.NumberColumn(format="%.2f"),
+                "Lots": st.column_config.NumberColumn(min_value=1, step=1),
+            },
+        )
+
+        legs = []
+        for _, r in legs_df.iterrows():
+            try:
+                legs.append({
+                    "kind": str(r["Type"]), "strike": float(r["Strike"] or 0),
+                    "premium": float(r["Premium"] or 0),
+                    "direction": str(r["Direction"]),
+                    "qty": int(r["Lots"] or 1) * lot,
+                })
+            except Exception:
+                continue
+
+        if not legs:
+            st.info("Add at least one leg above.")
+        else:
+            res = analyse_position(legs, spot)
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Max profit",
+                      "Unlimited" if res["unlimited_up"] else f"Rs {res['max_profit']:,.0f}")
+            m2.metric("Max loss",
+                      "Unlimited" if res["unlimited_down"] else f"Rs {res['max_loss']:,.0f}")
+            m3.metric("Net premium",
+                      f"Rs {res['net_premium']:,.0f}",
+                      help="Positive is a credit received, negative a debit paid.")
+            m4.metric("P&L at spot", f"Rs {res['payoff_at_spot']:,.0f}")
+
+            st.markdown(
+                "**Breakeven"
+                + ("s" if len(res["breakevens"]) != 1 else "")
+                + ":** "
+                + (", ".join(f"{b:,.2f}" for b in res["breakevens"])
+                   or "none — the position never crosses zero")
+            )
+
+            chart = pd.DataFrame({"Payoff": res["payoff"]},
+                                 index=pd.Index(res["grid"], name="Price at expiry"))
+            window = chart[(chart.index > spot * 0.8) & (chart.index < spot * 1.2)]
+            st.line_chart(window if len(window) > 50 else chart, height=320)
+
+            if res["unlimited_down"]:
+                st.markdown(
+                    '<div class="stale"><b>This position has unlimited loss.</b> '
+                    'A short call or short future has no cap on the upside, so no '
+                    'maximum loss exists. Size it on what you can afford to lose, '
+                    'not on the premium received.</div>',
+                    unsafe_allow_html=True,
+                )
+            elif not res["unlimited_up"]:
+                st.caption(
+                    f"Worst case if the underlying went to zero: "
+                    f"Rs {res['worst_at_zero']:,.0f}."
+                )
+
+            st.caption(
+                "Payoff is at expiry only. Before expiry the position is worth "
+                "something different because of time value and volatility — a "
+                "spread showing max profit here can be well short of it a week "
+                "early. Brokerage, STT and slippage are not included."
+            )
+
+    # ------------------------------------------------------------- chain ---
+    elif opt_view == "Option chain":
+        chain = load_latest_chain()
+        if chain.empty:
+            st.info(
+                "No chain data stored yet. The GitHub Action collects it — run "
+                "*Collect bhavcopy* once and it will snapshot every tracked "
+                "underlying, then keep doing so each weekday."
+            )
+        else:
+            syms = sorted(chain["SYMBOL"].unique())
+            c1, c2 = st.columns(2)
+            sym = c1.selectbox("Underlying", syms, key="chain_sym")
+            sub = chain[chain["SYMBOL"] == sym]
+            exps = list(pd.to_datetime(sub["EXPIRY"], format="%d-%b-%Y",
+                                       errors="coerce").dropna().sort_values()
+                        .dt.strftime("%d-%b-%Y").unique())
+            exp = c2.selectbox("Expiry", exps, key="chain_exp")
+
+            view = sub[sub["EXPIRY"] == exp].copy()
+            spot_val = pd.to_numeric(view["UNDERLYING"], errors="coerce").iloc[0]
+            for c in view.columns:
+                if c not in ("SYMBOL", "EXPIRY", "DATE"):
+                    view[c] = pd.to_numeric(view[c], errors="coerce")
+
+            st.caption(f"Spot {spot_val:,.2f} · snapshot dated {sub['DATE'].iloc[0]}")
+
+            view["CE view"] = [classify_oi(p, o) for p, o
+                               in zip(view["CE_CHG"], view["CE_CHG_OI"])]
+            view["PE view"] = [classify_oi(p, o) for p, o
+                               in zip(view["PE_CHG"], view["PE_CHG_OI"])]
+
+            near = view.iloc[(view["STRIKE"] - spot_val).abs().argsort()[:21]]
+            near = near.sort_values("STRIKE")
+
+            cols = ["CE_OI", "CE_CHG_OI", "CE_IV", "CE_LTP", "CE view", "STRIKE",
+                    "PE view", "PE_LTP", "PE_IV", "PE_CHG_OI", "PE_OI"]
+            st.dataframe(near[[c for c in cols if c in near.columns]],
+                         use_container_width=True, height=520, hide_index=True)
+
+            ce_oi, pe_oi = view["CE_OI"].sum(), view["PE_OI"].sum()
+            k1, k2, k3 = st.columns(3)
+            k1.metric("PCR (OI)", f"{pe_oi / ce_oi:.2f}" if ce_oi else "—")
+            k2.metric("Max call OI",
+                      f"{view.loc[view['CE_OI'].idxmax(), 'STRIKE']:,.0f}"
+                      if view["CE_OI"].notna().any() else "—")
+            k3.metric("Max put OI",
+                      f"{view.loc[view['PE_OI'].idxmax(), 'STRIKE']:,.0f}"
+                      if view["PE_OI"].notna().any() else "—")
+
+            st.markdown(
+                '<div class="stale">Open interest tells you what positions exist, '
+                'not who is right. The strike with the most call OI is routinely '
+                'described as resistance — it is equally consistent with writers '
+                'who will be run over. And this is an end-of-day snapshot: '
+                'intraday OI shifts are invisible here.</div>',
+                unsafe_allow_html=True,
+            )
+
+    # ---------------------------------------------------------- IV rank ----
+    else:
+        iv = load_iv_history()
+        if iv.empty:
+            st.info(
+                "No IV history yet. The collector starts building it on its next "
+                "run and one row per underlying per day accumulates from there."
+            )
+            st.caption(
+                "This is the tab worth waiting for. Today's implied volatility "
+                "in isolation says nothing — 28% is high for a large cap and low "
+                "for a smallcap. Its rank against that stock's own past year is "
+                "the useful number, and no free source sells it to you "
+                "retroactively. It exists only if you collected it."
+            )
+        else:
+            days = iv["DATE"].nunique()
+            st.caption(f"{days} day(s) collected · "
+                       f"{iv['DATE'].min():%d %b %Y} to {iv['DATE'].max():%d %b %Y}")
+
+            if days < 60:
+                st.markdown(
+                    f'<div class="stale">Only {days} days collected. IV rank needs '
+                    'months before it means anything — a rank computed against two '
+                    'weeks of history just says whether today beat a fortnight.</div>',
+                    unsafe_allow_html=True,
+                )
+
+            latest = iv[iv["DATE"] == iv["DATE"].max()]
+            rows = []
+            for _, r in latest.iterrows():
+                hist = iv[iv["SYMBOL"] == r["SYMBOL"]]["ATM_IV"]
+                rank, pctile, n = iv_rank(hist, r["ATM_IV"])
+                rows.append({
+                    "Symbol": r["SYMBOL"], "Spot": r.get("UNDERLYING"),
+                    "ATM IV %": r["ATM_IV"], "IV rank": rank,
+                    "IV percentile": pctile, "Days": n,
+                    "PCR": r.get("PCR"), "Max pain": r.get("MAX_PAIN"),
+                    "Expiry": r.get("EXPIRY"),
+                })
+            table = pd.DataFrame(rows).sort_values("IV rank", ascending=False,
+                                                   na_position="last")
+            st.dataframe(table.style.format(precision=2, na_rep="—"),
+                         use_container_width=True, hide_index=True)
+
+            st.caption(
+                "**IV rank** places today between the period's low and high. "
+                "**IV percentile** is the share of days that were lower. They "
+                "diverge when the distribution is skewed, which is precisely "
+                "when the difference matters. High rank means options are "
+                "expensive relative to this underlying's own history — which is "
+                "an argument about pricing, not about direction."
+            )
+
+            if len(iv) > 20:
+                pick = st.selectbox("Chart IV history for",
+                                    sorted(iv["SYMBOL"].unique()), key="iv_pick")
+                series = iv[iv["SYMBOL"] == pick].set_index("DATE")["ATM_IV"]
+                st.line_chart(series, height=260)
 
 
 with tab_hunt, safe_tab("Small-cap hunt"):
