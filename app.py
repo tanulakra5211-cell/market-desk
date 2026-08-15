@@ -819,11 +819,122 @@ def analyse_backlog(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("Book-to-Bill", ascending=False, na_position="last")
 
 
+@st.cache_data(ttl=21600)
+def cached_backlog_analysis() -> pd.DataFrame:
+    """Cached — this hits yfinance per ticker for the revenue denominator."""
+    return analyse_backlog(load_backlog())
+
+
 def load_watchlist() -> pd.DataFrame:
     path = DATA_DIR / "watchlist.csv"
     if path.exists():
         return pd.read_csv(path, dtype={"bse_scrip": str})
     return pd.read_csv(io.StringIO(DEFAULT_WATCHLIST), dtype={"bse_scrip": str})
+
+
+# ========================================================== TECHNICALS =======
+# Standard indicators computed from price history. These describe what price
+# and volume have ALREADY done. They are inputs to your judgement, not signals
+# to act on -- every one of them can and does persist while a stock falls.
+
+def _rsi(closes: pd.Series, period: int = 14) -> float:
+    delta = closes.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    if pd.isna(loss.iloc[-1]) or pd.isna(gain.iloc[-1]):
+        return float("nan")
+    if loss.iloc[-1] == 0:
+        return 100.0 if gain.iloc[-1] > 0 else float("nan")
+    rs = gain.iloc[-1] / loss.iloc[-1]
+    return 100 - (100 / (1 + rs))
+
+
+def fetch_technicals(tickers: list) -> pd.DataFrame:
+    """RSI, moving-average position, 52-week position and volume surge."""
+    if not tickers:
+        return pd.DataFrame()
+    try:
+        raw = yf.download(tickers, period="1y", interval="1d", group_by="ticker",
+                          progress=False, auto_adjust=False, threads=True)
+    except Exception:
+        return pd.DataFrame()
+
+    rows = []
+    for t in tickers:
+        try:
+            hist = raw[t] if len(tickers) > 1 else raw
+            closes = hist["Close"].dropna()
+            vols = hist["Volume"].dropna()
+            if len(closes) < 60:
+                continue
+
+            last = float(closes.iloc[-1])
+            sma20 = float(closes.rolling(20).mean().iloc[-1])
+            sma50 = float(closes.rolling(50).mean().iloc[-1])
+            sma200 = (float(closes.rolling(200).mean().iloc[-1])
+                      if len(closes) >= 200 else float("nan"))
+            hi52, lo52 = float(closes.max()), float(closes.min())
+
+            ema12 = closes.ewm(span=12).mean()
+            ema26 = closes.ewm(span=26).mean()
+            macd = ema12 - ema26
+            macd_hist = float((macd - macd.ewm(span=9).mean()).iloc[-1])
+
+            avg_vol = float(vols.rolling(20).mean().iloc[-1]) if len(vols) >= 20 else float("nan")
+            vol_surge = float(vols.iloc[-1]) / avg_vol if avg_vol else float("nan")
+
+            structure = "—"
+            if sma200 == sma200:
+                if last > sma50 > sma200:
+                    structure = "Above 50 & 200"
+                elif last < sma50 < sma200:
+                    structure = "Below 50 & 200"
+                else:
+                    structure = "Mixed"
+
+            rows.append({
+                "Ticker": t,
+                "Close": last,
+                "RSI (14)": _rsi(closes),
+                "vs 20DMA %": ((last - sma20) / sma20) * 100,
+                "vs 50DMA %": ((last - sma50) / sma50) * 100,
+                "vs 200DMA %": ((last - sma200) / sma200) * 100 if sma200 == sma200 else float("nan"),
+                "MA structure": structure,
+                "52W position %": ((last - lo52) / (hi52 - lo52)) * 100 if hi52 > lo52 else float("nan"),
+                "MACD hist": macd_hist,
+                "Vol vs 20d avg": vol_surge,
+            })
+        except Exception:
+            continue
+    return pd.DataFrame(rows)
+
+
+def market_breadth(screen: pd.DataFrame) -> dict:
+    """
+    Advance/decline breadth from the whole market. This is a measurement of
+    what the market did, unlike headline-counting, which measures what
+    journalists wrote.
+    """
+    if screen.empty or "Day %" not in screen.columns:
+        return {}
+    day = screen["Day %"].dropna()
+    if day.empty:
+        return {}
+
+    liquid = screen[screen["Turnover (Cr)"].fillna(0) >= 1]
+    liquid_day = liquid["Day %"].dropna()
+
+    return {
+        "advances": int((day > 0).sum()),
+        "declines": int((day < 0).sum()),
+        "unchanged": int((day == 0).sum()),
+        "ad_ratio": (day > 0).sum() / max((day < 0).sum(), 1),
+        "median_move": float(day.median()),
+        "liquid_advances": int((liquid_day > 0).sum()),
+        "liquid_declines": int((liquid_day < 0).sum()),
+        "up_5pct": int((day >= 5).sum()),
+        "down_5pct": int((day <= -5).sum()),
+    }
 
 
 # ============================================================== STYLING ======
@@ -893,6 +1004,11 @@ def load_flows():
 @st.cache_data(ttl=3600)
 def load_fno_oi():
     return fetch_fno_participant_oi()
+
+
+@st.cache_data(ttl=900)
+def load_technicals(tickers: tuple):
+    return fetch_technicals(list(tickers))
 
 
 @st.cache_data(ttl=86400)
@@ -1027,9 +1143,9 @@ st.markdown(f'<div class="pulse-strip">{"".join(cells)}</div>', unsafe_allow_htm
 
 # ================================================================= TABS ======
 
-(tab_market, tab_screen, tab_news, tab_flows,
+(tab_market, tab_screen, tab_tech, tab_news, tab_flows,
  tab_ratios, tab_book, tab_depth) = st.tabs(
-    ["Markets", "Screener (all NSE)", "News", "FII / DII",
+    ["Markets", "Screener (all NSE)", "Technicals", "News", "FII / DII",
      "Ratios", "Order Book", "Depth"]
 )
 
@@ -1098,6 +1214,25 @@ with tab_screen:
                 st.write("No attempts recorded.")
     else:
         st.caption(f"{len(screen):,} stocks · trading day {screen_date}")
+
+        breadth = market_breadth(screen)
+        if breadth:
+            st.markdown("**Market breadth**")
+            b1, b2, b3, b4 = st.columns(4)
+            b1.metric("Advances", f"{breadth['advances']:,}")
+            b2.metric("Declines", f"{breadth['declines']:,}")
+            b3.metric("A/D ratio", f"{breadth['ad_ratio']:.2f}")
+            b4.metric("Median move", f"{breadth['median_move']:+.2f}%")
+            st.caption(
+                f"{breadth['up_5pct']:,} stocks up 5%+ · "
+                f"{breadth['down_5pct']:,} down 5%+ · "
+                f"among liquid names (>1 Cr turnover): "
+                f"{breadth['liquid_advances']:,} up, {breadth['liquid_declines']:,} down. "
+                "Breadth measures what the market actually did — more informative "
+                "than counting positive headlines."
+            )
+            st.divider()
+
         with st.expander("Fetch log"):
             st.dataframe(pd.DataFrame(attempts, columns=["Date", "File", "Result"]),
                          use_container_width=True, hide_index=True)
@@ -1161,6 +1296,51 @@ with tab_screen:
             st.success(
                 f"{len(shortlist)} symbols queued. Open the Ratios tab and switch "
                 "the source to 'Screener shortlist'."
+            )
+
+
+with tab_tech:
+    st.markdown("#### Technical position")
+    st.markdown(
+        "Where each stock sits relative to its own moving averages, range and "
+        "average volume. These describe what price has **already** done. None of "
+        "them forecasts what it will do next — a stock can sit above its 200DMA "
+        "with RSI at 65 all the way down."
+    )
+
+    tech_source = st.radio("Source", ["Watchlist", "Screener shortlist"],
+                           horizontal=True, key="tech_source")
+    tech_target = (tuple(st.session_state.get("shortlist", []))
+                   if tech_source == "Screener shortlist" else tickers)
+
+    if not tech_target:
+        st.info("Nothing selected. Build a shortlist on the Screener tab first.")
+    else:
+        with st.spinner("Computing indicators…"):
+            tech = load_technicals(tech_target)
+
+        if tech.empty:
+            st.info("No price history returned for these symbols.")
+        else:
+            merged = tech.merge(wl[["ticker", "company"]], left_on="Ticker",
+                                right_on="ticker", how="left")
+            merged["Company"] = merged["company"].fillna(merged["Ticker"])
+            merged = merged.drop(columns=["ticker", "company"], errors="ignore")
+            cols = ["Company"] + [c for c in merged.columns
+                                  if c not in ("Company", "Ticker")]
+            st.dataframe(
+                colour_frame(merged[cols],
+                             ["vs 20DMA %", "vs 50DMA %", "vs 200DMA %", "MACD hist"]),
+                use_container_width=True, height=460, hide_index=True,
+            )
+
+            st.caption(
+                "**RSI (14)** — above 70 is conventionally 'overbought', below 30 "
+                "'oversold'; both persist for months in trending stocks. "
+                "**52W position %** — 0 is the year's low, 100 the high. "
+                "**Vol vs 20d avg** — above 2 means today's volume is double the "
+                "recent norm, which is worth pairing with the delivery % on the "
+                "Screener tab to tell accumulation from churn."
             )
 
 
@@ -1261,21 +1441,35 @@ with tab_ratios:
     else:
         target = tickers
 
-    ratios = pd.DataFrame()
+    # Fetching fundamentals is slow and Streamlit re-runs every tab on every
+    # interaction, so this is explicitly triggered rather than automatic.
+    # Otherwise it blocks the whole app on each click.
+    cache_key = str(sorted(target))
+    have_cached = st.session_state.get("_ratio_key") == cache_key
+    ratios = st.session_state.get("_ratio_data", pd.DataFrame()) if have_cached else pd.DataFrame()
+
     if target:
-        cache_key = str(sorted(target))
-        if st.session_state.get("_ratio_key") != cache_key:
-            bar = st.progress(0.0, text="Pulling fundamentals…")
+        label = ("Reload fundamentals" if have_cached
+                 else f"Load fundamentals for {len(target)} companies")
+        est = int(len(target) * 4)
+        if st.button(label, type="primary"):
+            bar = st.progress(0.0, text="Starting…")
             rows = []
             for i, t in enumerate(target):
                 rows.append(fetch_ratios([t]))
-                bar.progress((i + 1) / len(target), text=f"Fetched {i + 1} of {len(target)}")
+                bar.progress((i + 1) / len(target),
+                             text=f"{t} — {i + 1} of {len(target)}")
             bar.empty()
             ratios = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
             st.session_state["_ratio_key"] = cache_key
             st.session_state["_ratio_data"] = ratios
-        else:
-            ratios = st.session_state.get("_ratio_data", pd.DataFrame())
+
+        if not have_cached and ratios.empty:
+            st.info(
+                f"Click above to fetch. Roughly {est // 60}m {est % 60}s for "
+                f"{len(target)} companies — the source allows one at a time. "
+                "Results stay loaded until you change the selection."
+            )
 
     if ratios.empty:
         st.info("No fundamental data returned.")
@@ -1310,7 +1504,7 @@ with tab_book:
     )
 
     raw_backlog = load_backlog()
-    analysis = analyse_backlog(raw_backlog)
+    analysis = cached_backlog_analysis()
 
     if analysis.empty:
         st.info("No backlog entries yet.")
