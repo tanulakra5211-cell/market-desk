@@ -30,7 +30,7 @@ st.set_page_config(
 )
 
 DATA_DIR = Path(__file__).parent / "data"
-APP_VERSION = "v10 — options"
+APP_VERSION = "v11 — glossary"
 
 
 # ============================================================ DEFAULT DATA ===
@@ -2227,6 +2227,226 @@ def load_market_screen():
     return screen, latest_date, attempts
 
 
+# ============================================================== GLOSSARY =====
+# Every term the app shows, in plain English. Definitions say what a number
+# measures AND what it does not tell you -- the second half is usually the
+# part that costs money.
+
+GLOSSARY = {
+    # --- price and market
+    "Day %": "Change from yesterday's close to today's, in percent.",
+    "1M %": "Return over about 21 trading days. Not annualised.",
+    "3M %": "Return over about 63 trading days.",
+    "6M %": "Return over about 126 trading days.",
+    "1Y %": "Return over about 250 trading days, roughly one year.",
+    "Off 52W High %": "How far below the past year's highest close it now sits. "
+        "Always zero or negative. A large gap means it has fallen a long way "
+        "from its peak — which is neither a bargain nor a warning by itself.",
+    "52W High": "Highest closing price in the past year.",
+    "52W Low": "Lowest closing price in the past year.",
+    "Turnover (Cr)": "Rupee value traded today, in crore. The practical measure "
+        "of whether you can get in and out. Below about 1 crore, your own order "
+        "moves the price.",
+    "Volume": "Number of shares traded today.",
+    "Trades": "Number of separate transactions. High volume across few trades "
+        "means a handful of large orders rather than broad participation.",
+    "Delivery %": "The share of today's volume that actually settled into "
+        "demat accounts instead of being squared off the same day. High "
+        "delivery means buyers intend to hold; low delivery means churn. "
+        "This is the most underused free number in Indian markets.",
+    "Delivery trend": "Recent delivery percentage against its 20-day average. "
+        "Positive means a rising share of buyers are holding.",
+    "Range position %": "Where the price sits in its own recent range. 0 is the "
+        "period low, 100 the high.",
+
+    # --- technicals
+    "RSI": "Relative Strength Index, 0-100. Compares recent gains to recent "
+        "losses. Above 70 is called overbought, below 30 oversold — but both "
+        "persist for months in a trending stock, so neither is a signal on its own.",
+    "RSI (14)": "Relative Strength Index over 14 days. Above 70 is conventionally "
+        "overbought, below 30 oversold. Both can persist for months.",
+    "vs 20DMA %": "Distance from the 20-day moving average, in percent. A short-"
+        "term trend gauge.",
+    "vs 50DMA %": "Distance from the 50-day moving average. The medium-term trend.",
+    "vs 200DMA %": "Distance from the 200-day moving average. The long-term trend, "
+        "and the line most institutional mandates watch.",
+    "MACD hist": "The gap between the MACD line and its signal line. Positive and "
+        "widening means momentum is building; shrinking means it is fading.",
+    "Vol vs 20d": "Today's volume divided by the 20-day average. Above 2 means "
+        "double the usual activity. Pair it with delivery percentage — a volume "
+        "spike with low delivery is day-trading noise.",
+    "Vol vs 20d avg": "Today's volume against the 20-day average.",
+    "Above 50DMA": "Price is above its 50-day moving average.",
+    "Above 200DMA": "Price is above its 200-day moving average.",
+    "Golden cross": "The 50-day average has crossed above the 200-day. Widely "
+        "watched, weakly predictive, and it fires after the move has begun.",
+    "Death cross": "The 50-day average has crossed below the 200-day.",
+    "Breakout 20d": "Today's price is above the highest of the previous 20 days.",
+    "Breakdown 20d": "Today's price is below the lowest of the previous 20 days.",
+    "Consolidating": "The recent range has tightened well inside the longer range. "
+        "Says nothing about which way it breaks.",
+    "Higher highs & lows": "Both recent peaks and recent troughs are rising — "
+        "textbook uptrend structure.",
+    "Lower highs & lows": "Both peaks and troughs are falling — downtrend structure.",
+    "Bullish divergence": "Price made a lower low but momentum did not follow. "
+        "Sometimes precedes a turn; often does not.",
+    "Bearish divergence": "Price made a higher high but momentum did not follow.",
+    "Bullish engulfing": "Today's up candle fully covers yesterday's down candle.",
+    "Bearish engulfing": "Today's down candle fully covers yesterday's up candle.",
+    "Hammer": "A candle with a long lower wick — sellers pushed down and were "
+        "rejected.",
+    "Shooting star": "A candle with a long upper wick — buyers pushed up and were "
+        "rejected.",
+    "Doji": "Open and close almost equal. Indecision, nothing more.",
+    "Stance": "A weighted tally of the patterns found. It summarises what the "
+        "chart shows; it is not a probability and not a recommendation.",
+    "Score": "Bullish signals minus bearish signals.",
+    "ATR": "Average True Range — how much this stock typically moves in a day, "
+        "in rupees. The basis for position sizing and stop distance.",
+
+    # --- fundamentals
+    "P/E": "Price divided by earnings per share. How many rupees you pay per "
+        "rupee of annual profit. Only comparable within an industry.",
+    "Fwd P/E": "Same, using forecast earnings instead of past ones. Depends "
+        "entirely on whose forecast.",
+    "P/B": "Price divided by book value per share. Most meaningful for banks "
+        "and asset-heavy businesses.",
+    "EV/EBITDA": "Enterprise value against operating earnings. Includes debt, so "
+        "it compares leveraged and unleveraged companies more fairly than P/E.",
+    "ROE %": "Return on equity — profit as a percentage of shareholders' funds. "
+        "Can be flattered by heavy borrowing.",
+    "ROCE %": "Return on capital employed — profit before interest against all "
+        "capital used, debt included. Harder to flatter than ROE, which is why "
+        "it is the better quality test.",
+    "Op Margin %": "Operating profit as a share of revenue. Pricing power.",
+    "Net Margin %": "Net profit as a share of revenue, after everything.",
+    "D/E": "Debt divided by equity. How much of the business is borrowed. "
+        "Note this source reports it as a percentage, so 50 means 0.5x.",
+    "Current Ratio": "Current assets over current liabilities. Below 1 means "
+        "short-term obligations exceed short-term assets.",
+    "Rev Growth %": "Year-on-year revenue growth.",
+    "Profit Growth %": "Year-on-year earnings growth.",
+    "Div Yield %": "Annual dividend as a percentage of price.",
+    "EPS": "Earnings per share over the trailing twelve months.",
+    "Beta": "How much the stock moves relative to the market. Above 1 is more "
+        "volatile than the index, below 1 less.",
+    "Mkt Cap (Cr)": "Market capitalisation in crore — share price times shares "
+        "outstanding. The size of the company as the market prices it.",
+
+    # --- order book
+    "Order Book (Cr)": "Total value of contracts a company has won but not yet "
+        "executed. Disclosed in quarterly presentations only — no data feed "
+        "carries it.",
+    "Book-to-Bill": "Order book divided by trailing annual revenue. Above 3x "
+        "means roughly three years of work already contracted. Revenue "
+        "visibility, not profitability — a large book at thin margins is not good news.",
+    "Visibility (yrs)": "Years of revenue already contracted, at current run rate.",
+    "QoQ Change %": "Change in the order book against the previous quarter.",
+
+    # --- flows
+    "Net (Cr)": "Buy value minus sell value, in crore. Positive means net buying.",
+    "FII": "Foreign Institutional Investors — overseas funds. Their flows move "
+        "Indian large caps more than any other single factor.",
+    "DII": "Domestic Institutional Investors — Indian mutual funds, insurers, "
+        "pension funds. Often take the opposite side to FIIs.",
+    "A/D ratio": "Advancing stocks divided by declining ones. Above 1 means more "
+        "rose than fell. Measures breadth — how broad a move is, not how large.",
+
+    # --- options
+    "Delta": "How much the option's price moves for a 1 rupee move in the "
+        "underlying. A 0.5 delta call gains 50 paise per rupee. Also a rough "
+        "proxy for the chance of finishing in the money.",
+    "Gamma": "How fast delta itself changes. High gamma means the position's "
+        "behaviour shifts quickly — highest near the strike and near expiry.",
+    "Theta / day": "Rupees the position loses to time each day if nothing moves. "
+        "The reason most long option positions lose: being right on direction "
+        "but slow still loses money.",
+    "Vega / 1% IV": "Rupees gained or lost per one point change in implied "
+        "volatility. Why options can fall after good news — the event passes "
+        "and volatility collapses.",
+    "IV": "Implied volatility — the volatility the current price implies. Not a "
+        "forecast; it is what the market is charging.",
+    "IV %": "Implied volatility, solved from the option's closing price.",
+    "ATM IV %": "Implied volatility at the strike nearest the current price.",
+    "IV rank": "Where today's implied volatility sits between this underlying's "
+        "own low and high over the period. High rank means options are expensive "
+        "relative to their own history — an argument about price, not direction.",
+    "IV percentile": "The share of past days with lower implied volatility. "
+        "Differs from IV rank when the distribution is skewed.",
+    "PCR": "Put-Call Ratio — put open interest divided by call open interest. "
+        "Read as sentiment, though it mostly reflects hedging by large holders.",
+    "PCR (OI)": "Put open interest divided by call open interest.",
+    "OI": "Open Interest — contracts currently outstanding. Tells you what "
+        "positions exist, not who is right.",
+    "CHG_OI": "Change in open interest today. Rising OI means new positions; "
+        "falling OI means positions being closed.",
+    "Max pain": "The strike at which option writers would pay out least. Often "
+        "described as a magnet for price on evidence that is thin.",
+    "Long buildup": "Price up and open interest up — new buyers entering.",
+    "Short buildup": "Price down and open interest up — new sellers entering.",
+    "Short covering": "Price up and open interest down — sellers closing out.",
+    "Long unwinding": "Price down and open interest down — buyers exiting.",
+    "Breakeven": "The underlying price at which the position makes nothing and "
+        "loses nothing at expiry.",
+    "Lot size": "The fixed number of units in one contract. You trade whole lots.",
+    "Net premium": "Total paid or received. Positive is a credit, negative a debit.",
+
+    # --- backtest
+    "Hit rate": "Share of selected stocks that finished positive.",
+    "Beat market": "Share that beat the median stock over the same window. The "
+        "number that matters — a screen returning 18% when the median stock did "
+        "22% has cost you money.",
+    "Median return": "The middle outcome. More honest than the mean, which one "
+        "outlier can carry.",
+    "Peak gain %": "The best it got to at any point, not where it ended.",
+    "Max drawdown %": "The worst it got to at any point. A name that ended +40% "
+        "after being -60% is not one most people would have held.",
+}
+
+
+def explain(term: str) -> str:
+    """Definition for a column or label, or empty if there isn't one."""
+    if term in GLOSSARY:
+        return GLOSSARY[term]
+    for key, val in GLOSSARY.items():          # tolerate suffixes and prefixes
+        if key.lower() in str(term).lower():
+            return val
+    return ""
+
+
+def help_config(df) -> dict:
+    """
+    Attach a hover explanation to every column that has one.
+
+    Streamlit shows a small marker on the header; hovering gives the meaning.
+    Applied automatically wherever a table is rendered.
+    """
+    cfg = {}
+    for col in getattr(df, "columns", []):
+        text = explain(col)
+        if text:
+            cfg[col] = st.column_config.Column(str(col), help=text)
+    return cfg
+
+
+def glossary_panel(label: str = "What do these terms mean?") -> None:
+    """Searchable glossary, droppable on any tab."""
+    with st.expander(label):
+        q = st.text_input("Search", key=f"gloss_{abs(hash(label)) % 99999}",
+                          placeholder="e.g. theta, delivery, ROCE")
+        items = sorted(GLOSSARY.items())
+        if q.strip():
+            ql = q.strip().lower()
+            items = [(k, v) for k, v in items
+                     if ql in k.lower() or ql in v.lower()]
+        if not items:
+            st.caption("Nothing matches. Try a shorter word.")
+        for term, meaning in items[:40]:
+            st.markdown(f"**{term}** — {meaning}")
+        if len(items) > 40:
+            st.caption(f"{len(items) - 40} more — narrow the search.")
+
+
 # ============================================================== HELPERS ======
 
 def fmt(value, decimals: int = 2, dash: str = "—") -> str:
@@ -2288,6 +2508,9 @@ with st.sidebar:
         "All figures delayed. Research tool, not an execution tool."
     )
 
+    st.divider()
+    glossary_panel("Full glossary")
+
 wl = watchlist[watchlist["ticker"].isin(selected)] if selected else watchlist
 tickers = tuple(wl["ticker"].tolist())
 
@@ -2343,8 +2566,8 @@ with tab_market, safe_tab("Markets"):
             merged = merged[["company", "sector", "Last", "Day %", "1M %", "6M %",
                              "1Y %", "Off 52W High %"]].rename(
                 columns={"company": "Company", "sector": "Sector"})
-            st.dataframe(
-                colour_frame(merged, ["Day %", "1M %", "6M %", "1Y %", "Off 52W High %"]),
+            st.dataframe(colour_frame(merged, ["Day %", "1M %", "6M %", "1Y %", "Off 52W High %"]),
+                     column_config=help_config(merged),
                 use_container_width=True, height=520, hide_index=True,
             )
 
@@ -2353,14 +2576,15 @@ with tab_market, safe_tab("Markets"):
         if global_df.empty:
             st.info("Global data unavailable. Hit Refresh.")
         else:
-            st.dataframe(
-                colour_frame(global_df.drop(columns=["Symbol"]), ["Change %"]),
+            st.dataframe(colour_frame(global_df.drop(columns=["Symbol"]), ["Change %"]),
+                     column_config=help_config(global_df.drop(columns=["Symbol"])),
                 use_container_width=True, height=520, hide_index=True,
             )
 
 
 with tab_screen, safe_tab("Screener"):
     st.markdown("#### Whole-market screener")
+    glossary_panel("What do these columns mean?")
     st.caption(
         "Every EQ-series stock on NSE, from the daily bhavcopy — one file, one "
         "request. Screen here on price and volume, then send a shortlist to the "
@@ -2446,8 +2670,8 @@ with tab_screen, safe_tab("Screener"):
         view = view.sort_values(sort_by, ascending=not descending, na_position="last")
 
         st.caption(f"{len(view):,} stocks pass the filters.")
-        st.dataframe(
-            colour_frame(view.head(500), ["Day %", "1M %"]),
+        st.dataframe(colour_frame(view.head(500), ["Day %", "1M %"]),
+                     column_config=help_config(view.head(500)),
             use_container_width=True, height=520, hide_index=True,
         )
         if len(view) > 500:
@@ -2482,6 +2706,7 @@ with tab_screen, safe_tab("Screener"):
 
 with tab_tech, safe_tab("Technicals"):
     st.markdown("#### Technical position")
+    glossary_panel("What do RSI, DMA and delivery trend mean?")
     st.markdown(
         "Where each stock sits relative to its own moving averages, range and "
         "average volume. These describe what price has **already** done. None of "
@@ -2553,9 +2778,9 @@ with tab_tech, safe_tab("Technicals"):
                 v = v[lead + [c for c in v.columns if c not in lead]]
 
                 st.caption(f"{len(v):,} stocks pass.")
-                st.dataframe(
-                    colour_frame(v.head(400), ["vs 20DMA %", "vs 50DMA %", "vs 200DMA %",
+                st.dataframe(colour_frame(v.head(400), ["vs 20DMA %", "vs 50DMA %", "vs 200DMA %",
                                                "1M %", "3M %", "6M %", "Delivery trend"]),
+                     column_config=help_config(v.head(400)),
                     use_container_width=True, height=520, hide_index=True,
                 )
                 st.download_button("Download as CSV",
@@ -2869,6 +3094,7 @@ with tab_tech, safe_tab("Technicals"):
 
 with tab_opt, safe_tab("Options"):
     st.markdown("#### Options")
+    glossary_panel("What do delta, theta, IV rank and PCR mean?")
 
     opt_view = st.radio(
         "View",
@@ -2975,8 +3201,8 @@ with tab_opt, safe_tab("Options"):
                     o_kind == "call", o_dir, qty, ca["atr_pct"], iv_shift)
 
                 st.markdown("**If this happens, this is what you have**")
-                st.dataframe(
-                    colour_frame(tbl, ["Move %", "P&L", "Return %"]),
+                st.dataframe(colour_frame(tbl, ["Move %", "P&L", "Return %"]),
+                     column_config=help_config(tbl),
                     use_container_width=True, hide_index=True)
 
                 g = greeks(ca["last"], o_strike, days_exp / 365.0, iv_use / 100.0,
@@ -3376,6 +3602,7 @@ with tab_hunt, safe_tab("Small-cap hunt"):
 
 with tab_test, safe_tab("Backtest"):
     st.markdown("#### Backtest a screen")
+    glossary_panel("What do hit rate, drawdown and beat market mean?")
     st.markdown(
         "Apply your filters to the market **as it looked on a past date**, then "
         "show what every selected name actually did afterwards. Losers included, "
@@ -3669,6 +3896,7 @@ with tab_news, safe_tab("News"):
 
 with tab_flows, safe_tab("FII/DII"):
     st.markdown("#### Institutional flows")
+    glossary_panel("What are FII, DII and A/D ratio?")
 
     if flows_df.empty:
         st.markdown(
@@ -3680,6 +3908,7 @@ with tab_flows, safe_tab("FII/DII"):
     else:
         st.caption(f"Cash market, Rs crore · session dated {flows_df.iloc[0]['Date']}")
         st.dataframe(colour_frame(flows_df, ["Net (Cr)"]),
+                     column_config=help_config(flows_df),
                      use_container_width=True, hide_index=True)
         st.bar_chart(flows_df.set_index("Participant")[["Buy (Cr)", "Sell (Cr)"]], height=280)
 
@@ -3692,11 +3921,13 @@ with tab_flows, safe_tab("FII/DII"):
     if oi.empty:
         st.info("Not published yet for today. NSE releases this after close on trading days.")
     else:
-        st.dataframe(oi, use_container_width=True, hide_index=True)
+        st.dataframe(oi,
+                     column_config=help_config(oi), use_container_width=True, hide_index=True)
 
 
 with tab_ratios, safe_tab("Ratios"):
     st.markdown("#### Fundamentals")
+    glossary_panel("What do these ratios mean?")
     st.caption("Cached six hours — the source is rate-limited, so repeated refreshes "
                "will get you throttled.")
 
@@ -3778,6 +4009,7 @@ with tab_ratios, safe_tab("Ratios"):
 
 with tab_book, safe_tab("Order Book"):
     st.markdown("#### Order backlog")
+    glossary_panel("What is book-to-bill?")
     st.markdown(
         "Company order books are disclosed in quarterly investor presentations and "
         "nowhere else — no data feed carries them. Log the number here after each "
