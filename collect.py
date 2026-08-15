@@ -66,7 +66,7 @@ def make_client() -> httpx.Client:
     return client
 
 
-def fetch_day(client: httpx.Client, date: datetime) -> pd.DataFrame:
+def fetch_day(client: httpx.Client, date: datetime, diag: list) -> pd.DataFrame:
     """One trading day, normalised. Empty frame on a holiday or failure."""
     archive_headers = {
         "Referer": "https://www.nseindia.com/all-reports",
@@ -77,6 +77,7 @@ def fetch_day(client: httpx.Client, date: datetime) -> pd.DataFrame:
     url = SEC_BHAV_URL.format(ddmmyyyy=date.strftime("%d%m%Y"))
     try:
         resp = client.get(url, headers=archive_headers)
+        diag.append(resp.status_code)
         if resp.status_code == 200 and not resp.content[:20].lstrip().lower().startswith(b"<"):
             df = pd.read_csv(io.StringIO(resp.text))
             df.columns = [c.strip() for c in df.columns]
@@ -102,6 +103,7 @@ def fetch_day(client: httpx.Client, date: datetime) -> pd.DataFrame:
     url = UDIFF_URL.format(yyyymmdd=date.strftime("%Y%m%d"))
     try:
         resp = client.get(url, headers=archive_headers)
+        diag.append(resp.status_code)
         if resp.status_code != 200:
             return pd.DataFrame()
         with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
@@ -189,22 +191,54 @@ def main() -> int:
     print(f"Fetching {len(days)} trading day(s)…")
     client = make_client()
     stored = failed = 0
+    statuses: dict = {}
 
-    for day in sorted(days):
+    for n, day in enumerate(sorted(days)):
         label = day.strftime("%Y-%m-%d")
-        df = fetch_day(client, day)
+        diag: list = []
+        df = fetch_day(client, day, diag)
+        for code in diag:
+            statuses[code] = statuses.get(code, 0) + 1
+
         if df.empty:
-            print(f"  {label}: no data (holiday or refused)")
+            print(f"  {label}: no data (HTTP {diag or 'error'})")
             failed += 1
+            # Re-prime the session periodically -- cookies expire mid-run.
+            if failed % 25 == 0:
+                print("    re-priming session…")
+                try:
+                    client.close()
+                    client = make_client()
+                except Exception as exc:  # noqa: BLE001
+                    print(f"    re-prime failed: {exc}", file=sys.stderr)
         else:
             store(df)
             print(f"  {label}: {len(df):,} stocks stored")
             stored += 1
+
+        # Bail out early if NSE is clearly refusing everything, rather than
+        # spending ten minutes proving it.
+        if n >= 14 and stored == 0:
+            print("\nAborting: 15 consecutive days returned nothing.")
+            break
+
         time.sleep(0.4)  # stay under NSE's ~3 req/sec limit
 
     client.close()
+
     print(f"\nDone. {stored} day(s) stored, {failed} unavailable.")
-    return 0 if stored or not days else 1
+    print("HTTP status counts:", dict(sorted(statuses.items())) or "none recorded")
+
+    if stored == 0:
+        print(
+            "\nNothing was stored. If the statuses above are mostly 403, NSE is "
+            "blocking this server's IP range and the collector needs to run "
+            "somewhere else -- see README. If they are 404, the URL pattern is "
+            "wrong. If no statuses appear at all, the initial handshake failed."
+        )
+    # Exit 0 unless nothing at all was stored, so one bad day doesn't turn the
+    # whole schedule red.
+    return 1 if stored == 0 else 0
 
 
 if __name__ == "__main__":
