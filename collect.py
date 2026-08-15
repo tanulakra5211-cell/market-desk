@@ -214,6 +214,159 @@ def collect_flows(client: httpx.Client) -> bool:
     return True
 
 
+
+OPTIONS_DIR = Path(__file__).parent / "data" / "options"
+IV_PATH = Path(__file__).parent / "data" / "iv_history.csv"
+
+# Underlyings to snapshot daily. Indices use a different endpoint to stocks.
+CHAIN_INDICES = ["NIFTY", "BANKNIFTY", "FINNIFTY"]
+CHAIN_STOCKS = ["RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "TCS",
+                "SBIN", "ITC", "LT", "BHARTIARTL", "BEL", "HAL"]
+
+
+def fetch_chain(client: httpx.Client, symbol: str, is_index: bool):
+    """One underlying's full option chain. Returns (rows, underlying) or (None, None)."""
+    endpoint = "option-chain-indices" if is_index else "option-chain-equities"
+    url = f"{NSE_BASE}/api/{endpoint}?symbol={symbol}"
+    try:
+        resp = client.get(url, headers={"Referer": f"{NSE_BASE}/option-chain"})
+        if resp.status_code != 200:
+            return None, f"HTTP {resp.status_code}"
+        payload = resp.json()
+    except Exception as exc:  # noqa: BLE001
+        return None, f"{type(exc).__name__}: {str(exc)[:60]}"
+
+    records = (payload or {}).get("records", {})
+    data = records.get("data", []) or []
+    underlying = records.get("underlyingValue")
+    if not data:
+        return None, "no data in payload"
+
+    rows = []
+    for item in data:
+        strike = item.get("strikePrice")
+        expiry = item.get("expiryDate")
+        row = {"STRIKE": strike, "EXPIRY": expiry}
+        for side, prefix in (("CE", "CE"), ("PE", "PE")):
+            leg = item.get(side) or {}
+            row[f"{prefix}_OI"] = leg.get("openInterest")
+            row[f"{prefix}_CHG_OI"] = leg.get("changeinOpenInterest")
+            row[f"{prefix}_IV"] = leg.get("impliedVolatility")
+            row[f"{prefix}_LTP"] = leg.get("lastPrice")
+            row[f"{prefix}_CHG"] = leg.get("change")
+            row[f"{prefix}_VOL"] = leg.get("totalTradedVolume")
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    df["SYMBOL"] = symbol
+    df["UNDERLYING"] = underlying
+    return df, "ok"
+
+
+def summarise_chain(df: pd.DataFrame, underlying: float) -> dict:
+    """
+    ATM implied volatility, put-call ratio and max pain for the nearest expiry.
+
+    These are descriptions of current positioning, not forecasts. Max pain in
+    particular is widely treated as a price magnet on evidence that is thin.
+    """
+    if df.empty or underlying is None:
+        return {}
+
+    expiries = sorted(pd.to_datetime(df["EXPIRY"], format="%d-%b-%Y",
+                                     errors="coerce").dropna().unique())
+    if not expiries:
+        return {}
+    near = pd.Timestamp(expiries[0]).strftime("%d-%b-%Y")
+    chain = df[df["EXPIRY"] == near].copy()
+    if chain.empty:
+        return {}
+
+    for c in ["STRIKE", "CE_OI", "PE_OI", "CE_IV", "PE_IV"]:
+        chain[c] = pd.to_numeric(chain[c], errors="coerce")
+
+    # ATM = strike closest to spot; IV = mean of the two sides where present
+    atm_row = chain.iloc[(chain["STRIKE"] - underlying).abs().argsort()[:1]]
+    ivs = [v for v in [atm_row["CE_IV"].iloc[0], atm_row["PE_IV"].iloc[0]]
+           if pd.notna(v) and v > 0]
+    atm_iv = sum(ivs) / len(ivs) if ivs else float("nan")
+
+    ce_oi, pe_oi = chain["CE_OI"].sum(), chain["PE_OI"].sum()
+    pcr = pe_oi / ce_oi if ce_oi else float("nan")
+
+    # Max pain: the strike at which option writers pay out the least in total
+    pains = []
+    for s in chain["STRIKE"].dropna().unique():
+        ce_pay = (chain["CE_OI"] * (s - chain["STRIKE"]).clip(lower=0)).sum()
+        pe_pay = (chain["PE_OI"] * (chain["STRIKE"] - s).clip(lower=0)).sum()
+        pains.append((ce_pay + pe_pay, s))
+    max_pain = min(pains)[1] if pains else float("nan")
+
+    return {
+        "EXPIRY": near, "UNDERLYING": underlying, "ATM_STRIKE": float(atm_row["STRIKE"].iloc[0]),
+        "ATM_IV": atm_iv, "PCR": pcr, "MAX_PAIN": float(max_pain),
+        "CE_OI_TOTAL": float(ce_oi), "PE_OI_TOTAL": float(pe_oi),
+    }
+
+
+def collect_options(client: httpx.Client) -> int:
+    """
+    Snapshot every tracked chain and append the daily IV/PCR/max-pain summary.
+
+    The IV history is the point of this: a single day's implied volatility says
+    nothing, but its rank against the past year is the most useful single
+    number in options, and nobody sells it to you retroactively. It only exists
+    if you started collecting.
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    OPTIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+    chains, summaries, ok = [], [], 0
+    targets = ([(s, True) for s in CHAIN_INDICES]
+               + [(s, False) for s in CHAIN_STOCKS])
+
+    for symbol, is_index in targets:
+        df, note = fetch_chain(client, symbol, is_index)
+        if df is None:
+            print(f"    {symbol}: {note}")
+            time.sleep(0.5)
+            continue
+
+        underlying = df["UNDERLYING"].iloc[0]
+        df["DATE"] = today
+        chains.append(df)
+
+        summ = summarise_chain(df, underlying)
+        if summ:
+            summ.update({"DATE": today, "SYMBOL": symbol})
+            summaries.append(summ)
+        ok += 1
+        print(f"    {symbol}: {len(df)} strikes, spot {underlying}")
+        time.sleep(0.5)  # stay under NSE's rate limit
+
+    if chains:
+        snap = pd.concat(chains, ignore_index=True)
+        path = OPTIONS_DIR / f"{today[:7]}.csv.gz"
+        if path.exists():
+            prev = pd.read_csv(path, skipinitialspace=True)
+            prev = prev[prev["DATE"] != today]
+            snap = pd.concat([prev, snap], ignore_index=True)
+        snap.to_csv(path, index=False, compression="gzip")
+
+    if summaries:
+        new = pd.DataFrame(summaries)
+        if IV_PATH.exists():
+            prev = pd.read_csv(IV_PATH, skipinitialspace=True)
+            combined = pd.concat([prev, new], ignore_index=True)
+            combined = combined.drop_duplicates(subset=["DATE", "SYMBOL"], keep="last")
+        else:
+            combined = new
+        combined.sort_values(["DATE", "SYMBOL"]).to_csv(IV_PATH, index=False)
+        print(f"    IV history: {len(combined)} rows on file")
+
+    return ok
+
+
 def month_path(date_str: str) -> Path:
     return HISTORY_DIR / f"{date_str[:7]}.csv.gz"
 
@@ -283,6 +436,9 @@ def main() -> int:
         print("\nCollecting FII/DII flows…")
         client = make_client()
         collect_flows(client)
+
+        print("\nCollecting option chains…")
+        collect_options(client)
         client.close()
         return 0
 
@@ -348,6 +504,9 @@ def main() -> int:
     # where every bhavcopy date was already on disk.
     print("\nCollecting FII/DII flows…")
     collect_flows(client)
+
+    print("\nCollecting option chains…")
+    collect_options(client)
 
     client.close()
 
