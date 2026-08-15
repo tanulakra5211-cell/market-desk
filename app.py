@@ -30,7 +30,7 @@ st.set_page_config(
 )
 
 DATA_DIR = Path(__file__).parent / "data"
-APP_VERSION = "v13 — setups"
+APP_VERSION = "v14 — disclosures & journal"
 
 
 # ============================================================ DEFAULT DATA ===
@@ -2489,12 +2489,195 @@ def position_size(capital: float, risk_pct: float, entry: float, stop: float):
     return shares, shares * entry
 
 
+# ================================================ DISCLOSURES & CALENDAR =====
+
+DEALS_PATH = DATA_DIR / "deals.csv"
+INSIDER_PATH = DATA_DIR / "insider.csv"
+ACTIONS_PATH = DATA_DIR / "corporate_actions.csv"
+MEETINGS_PATH = DATA_DIR / "board_meetings.csv"
+JOURNAL_PATH = DATA_DIR / "journal.csv"
+
+
+def _load_csv(path: Path, date_cols=()) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(path, skipinitialspace=True)
+    except Exception:
+        return pd.DataFrame()
+    for c in date_cols:
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors="coerce", dayfirst=True)
+    return df
+
+
+@st.cache_data(ttl=1800)
+def load_deals():
+    return _load_csv(DEALS_PATH, ["DATE"])
+
+
+@st.cache_data(ttl=1800)
+def load_insider():
+    return _load_csv(INSIDER_PATH, ["DATE"])
+
+
+@st.cache_data(ttl=1800)
+def load_actions():
+    return _load_csv(ACTIONS_PATH, ["EX_DATE", "RECORD_DATE"])
+
+
+@st.cache_data(ttl=1800)
+def load_meetings():
+    return _load_csv(MEETINGS_PATH, ["MEETING_DATE"])
+
+
+def events_before(symbol: str, days: int) -> pd.DataFrame:
+    """
+    Scheduled events for a symbol within the next N days.
+
+    Used by the options calculator: an earnings date inside your holding
+    period is precisely when implied volatility collapses, and a scenario
+    priced without knowing that is misleading.
+    """
+    base = str(symbol).replace(".NS", "").upper()
+    today = pd.Timestamp(datetime.now().date())
+    cutoff = today + pd.Timedelta(days=days)
+    out = []
+
+    mtg = load_meetings()
+    if not mtg.empty and "SYMBOL" in mtg.columns:
+        m = mtg[(mtg["SYMBOL"].astype(str).str.upper() == base)
+                & (mtg["MEETING_DATE"] >= today)
+                & (mtg["MEETING_DATE"] <= cutoff)]
+        for _, r in m.iterrows():
+            out.append({"Date": r["MEETING_DATE"], "Event": "Board meeting",
+                        "Detail": str(r.get("PURPOSE", ""))[:120]})
+
+    act = load_actions()
+    if not act.empty and "SYMBOL" in act.columns:
+        a = act[(act["SYMBOL"].astype(str).str.upper() == base)
+                & (act["EX_DATE"] >= today) & (act["EX_DATE"] <= cutoff)]
+        for _, r in a.iterrows():
+            out.append({"Date": r["EX_DATE"], "Event": "Ex-date",
+                        "Detail": str(r.get("PURPOSE", ""))[:120]})
+
+    df = pd.DataFrame(out)
+    return df.sort_values("Date") if not df.empty else df
+
+
+# =============================================================== JOURNAL =====
+# The only thing here that produces information nobody else has. Memory
+# reliably rewrites why you took a trade; a written thesis does not.
+
+JOURNAL_COLUMNS = ["date", "symbol", "setup", "bias", "entry", "stop", "target",
+                   "qty", "thesis", "invalidation", "status", "exit_price",
+                   "exit_date", "notes"]
+
+
+def load_journal() -> pd.DataFrame:
+    if JOURNAL_PATH.exists():
+        try:
+            df = pd.read_csv(JOURNAL_PATH, skipinitialspace=True)
+            for c in JOURNAL_COLUMNS:
+                if c not in df.columns:
+                    df[c] = ""
+            return df[JOURNAL_COLUMNS]
+        except Exception:
+            pass
+    return pd.DataFrame(columns=JOURNAL_COLUMNS)
+
+
+def score_journal(journal: pd.DataFrame, hist: pd.DataFrame) -> pd.DataFrame:
+    """
+    Mark each logged idea against what the price actually did.
+
+    Open positions are marked to the last stored close; closed ones use the
+    exit you recorded. Both are shown, because a run of open winners is not
+    the same as a record of realised ones.
+    """
+    if journal.empty:
+        return pd.DataFrame()
+
+    latest = {}
+    if not hist.empty:
+        last_day = hist[hist["DATE"] == hist["DATE"].max()]
+        latest = dict(zip(last_day["SYMBOL"], last_day["CLOSE"]))
+
+    rows = []
+    for _, r in journal.iterrows():
+        sym = str(r.get("symbol", "")).replace(".NS", "").upper()
+        try:
+            entry = float(r.get("entry") or 0)
+            stop = float(r.get("stop") or 0)
+            qty = float(r.get("qty") or 0)
+        except (TypeError, ValueError):
+            continue
+        if entry <= 0:
+            continue
+
+        status = str(r.get("status", "open")).lower()
+        closed = status.startswith("clos")
+        try:
+            exit_px = float(r.get("exit_price") or 0)
+        except (TypeError, ValueError):
+            exit_px = 0.0
+        mark = exit_px if (closed and exit_px > 0) else latest.get(sym, float("nan"))
+
+        long_side = str(r.get("bias", "long")).lower() != "short"
+        if mark == mark:
+            move = (mark - entry) if long_side else (entry - mark)
+            ret_pct = (move / entry) * 100
+            pnl = move * qty
+        else:
+            ret_pct = pnl = float("nan")
+
+        planned_risk = abs(entry - stop) if stop else float("nan")
+        r_multiple = (move / planned_risk) if (mark == mark and planned_risk
+                                               and planned_risk == planned_risk
+                                               and planned_risk > 0) else float("nan")
+
+        rows.append({
+            "Date": r.get("date", ""), "Symbol": sym, "Setup": r.get("setup", ""),
+            "Bias": r.get("bias", ""), "Status": "closed" if closed else "open",
+            "Entry": entry, "Mark": mark, "Return %": ret_pct, "P&L": pnl,
+            "R multiple": r_multiple,
+            "Thesis": str(r.get("thesis", ""))[:160],
+            "Invalidation": str(r.get("invalidation", ""))[:160],
+        })
+    return pd.DataFrame(rows)
+
+
+def journal_stats(scored: pd.DataFrame) -> dict:
+    """Headline record. Closed trades only — open ones are not results yet."""
+    if scored.empty:
+        return {}
+    closed = scored[scored["Status"] == "closed"]
+    live = scored[scored["Status"] == "open"]
+    rets = closed["Return %"].dropna()
+    rmul = closed["R multiple"].dropna()
+    return {
+        "closed": len(closed), "open": len(live),
+        "hit_rate": (rets > 0).mean() * 100 if len(rets) else float("nan"),
+        "median_return": rets.median() if len(rets) else float("nan"),
+        "total_pnl": closed["P&L"].dropna().sum() if len(closed) else 0.0,
+        "avg_r": rmul.mean() if len(rmul) else float("nan"),
+        "best": rets.max() if len(rets) else float("nan"),
+        "worst": rets.min() if len(rets) else float("nan"),
+    }
+
+
 # ============================================================== GLOSSARY =====
 # Every term the app shows, in plain English. Definitions say what a number
 # measures AND what it does not tell you -- the second half is usually the
 # part that costs money.
 
 GLOSSARY = {
+    "Board meeting": "When results are approved. For options, a date inside your holding period is when implied volatility collapses.",
+    "Ex-date": "The date from which a buyer no longer receives the dividend. Price drops by roughly the dividend — not a loss, but it looks like one on a chart.",
+    "R multiple": "Profit as a multiple of the risk you planned. Above 0.3 over many trades is a real result; a single high R is luck.",
+    "Insider filing": "A SEBI Regulation 7(2) disclosure — promoters and designated persons must report their own dealings.",
+    "Block deal": "A large pre-negotiated trade in a separate window, both sides agreed in advance.",
+    "Bulk deal": "A trade above 0.5% of a company's equity, reported with the client named.",
     "Reward %": "Distance from entry to target, as a percentage.",
     "Risk %": "Distance from entry to stop, as a percentage. A wider stop means a smaller position.",
     "Target": "The next structural level, or a multiple of typical daily range.",
@@ -2819,11 +3002,12 @@ st.markdown(f'<div class="pulse-strip">{"".join(cells)}</div>', unsafe_allow_htm
 
 # ================================================================= TABS ======
 
-(tab_market, tab_setups, tab_screen, tab_tech, tab_opt, tab_hunt, tab_test,
- tab_news, tab_flows, tab_ratios, tab_book, tab_depth) = st.tabs(
+(tab_market, tab_setups, tab_screen, tab_tech, tab_opt, tab_disc, tab_journal,
+ tab_hunt, tab_test, tab_news, tab_flows, tab_ratios, tab_book,
+ tab_depth) = st.tabs(
     ["Markets", "Weekly setups", "Screener (all NSE)", "Technicals", "Options",
-     "Small-cap hunt", "Backtest", "News", "FII / DII", "Ratios", "Order Book",
-     "Depth"]
+     "Disclosures", "Journal", "Small-cap hunt", "Backtest", "News", "FII / DII",
+     "Ratios", "Order Book", "Depth"]
 )
 
 with tab_market, safe_tab("Markets"):
@@ -3602,6 +3786,25 @@ with tab_opt, safe_tab("Options"):
                         "default volatility is being used instead."
                     )
 
+                ev = events_before(sc_pick, int(days_exp))
+                if not ev.empty:
+                    inside = ev[ev["Date"] <= pd.Timestamp(datetime.now().date())
+                                + pd.Timedelta(days=int(hold))]
+                    lines = " · ".join(
+                        f"{r['Event']} on {r['Date']:%d %b}" for _, r in ev.iterrows())
+                    if not inside.empty:
+                        st.markdown(
+                            f'<div class="stale"><b>There is a scheduled event inside '
+                            f'your holding period.</b> {lines}. This is exactly when '
+                            f'implied volatility collapses: the uncertainty the '
+                            f'premium was pricing resolves, and the option can lose '
+                            f'value even if the stock moves your way. Set the IV '
+                            f'change box to -5 or -10 and look at the difference '
+                            f'before taking this.</div>', unsafe_allow_html=True)
+                    else:
+                        st.caption(f"Scheduled before expiry: {lines}. Outside your "
+                                   "holding window, but it will affect the premium.")
+
                 tbl = scenario_table(
                     ca["last"], o_strike, o_prem, days_exp, hold, iv_use,
                     o_kind == "call", o_dir, qty, ca["atr_pct"], iv_shift)
@@ -3888,6 +4091,191 @@ with tab_opt, safe_tab("Options"):
                                     sorted(iv["SYMBOL"].unique()), key="iv_pick")
                 series = iv[iv["SYMBOL"] == pick].set_index("DATE")["ATM_IV"]
                 st.line_chart(series, height=260)
+
+
+with tab_disc, safe_tab("Disclosures"):
+    st.markdown("#### Deals, insiders and the corporate calendar")
+
+    deals, insider = load_deals(), load_insider()
+    actions, meetings = load_actions(), load_meetings()
+
+    if all(d.empty for d in (deals, insider, actions, meetings)):
+        st.info(
+            "Nothing collected yet. Run the *Collect bhavcopy* workflow — it now "
+            "also pulls bulk and block deals, insider filings, corporate actions "
+            "and board meeting dates."
+        )
+    else:
+        view = st.radio("View", ["Bulk & block deals", "Insider filings",
+                                 "Results calendar", "Corporate actions"],
+                        horizontal=True, key="disc_view")
+
+        only_mine = st.checkbox("Only my watchlist", value=False, key="disc_mine")
+        watch = {t.replace(".NS", "").upper() for t in tickers}
+
+        def narrow(df):
+            if only_mine and not df.empty and "SYMBOL" in df.columns:
+                return df[df["SYMBOL"].astype(str).str.upper().isin(watch)]
+            return df
+
+        if view == "Bulk & block deals":
+            d = narrow(deals)
+            if d.empty:
+                st.info("No deals stored for this selection.")
+            else:
+                side = st.multiselect("Side", sorted(d["SIDE"].dropna().unique()),
+                                      key="disc_side")
+                if side:
+                    d = d[d["SIDE"].isin(side)]
+                d = d.sort_values("DATE", ascending=False)
+                st.caption(f"{len(d):,} deals · {d['SYMBOL'].nunique()} companies")
+                st.dataframe(d.head(400), use_container_width=True, height=460,
+                             hide_index=True)
+                st.markdown(
+                    '<div class="stale">Every trade above half a percent of equity '
+                    'is reported here with the buyer named. That makes it a '
+                    'disclosure rather than a rumour — but a named fund buying is '
+                    'not a recommendation, and bulk deals are frequently one side '
+                    'of a block that was pre-negotiated at an agreed price.</div>',
+                    unsafe_allow_html=True)
+
+        elif view == "Insider filings":
+            i = narrow(insider)
+            if i.empty:
+                st.info("No insider filings stored for this selection.")
+            else:
+                i = i.sort_values("DATE", ascending=False)
+                st.caption(f"{len(i):,} filings · {i['SYMBOL'].nunique()} companies")
+                st.dataframe(i.head(400), use_container_width=True, height=460,
+                             hide_index=True)
+                st.markdown(
+                    '<div class="stale">SEBI Regulation 7(2) disclosures. Promoter '
+                    'buying in the open market is one of the few genuinely '
+                    'informative signals in a small cap. Read the <b>MODE</b> '
+                    'column carefully — shares received under an ESOP or a gift '
+                    'are not someone spending their own money, and <b>pledge</b> '
+                    'entries are the risk the fundamentals screen cannot see.</div>',
+                    unsafe_allow_html=True)
+
+        elif view == "Results calendar":
+            m = narrow(meetings)
+            if m.empty:
+                st.info("No board meetings stored for this selection.")
+            else:
+                today = pd.Timestamp(datetime.now().date())
+                m = m[m["MEETING_DATE"] >= today].sort_values("MEETING_DATE")
+                m = m.assign(**{"Days away": (m["MEETING_DATE"] - today).dt.days})
+                st.caption(f"{len(m):,} upcoming board meetings")
+                st.dataframe(m, use_container_width=True, height=460, hide_index=True)
+                st.caption(
+                    "Board meetings are when results are approved. For options, a "
+                    "date inside your holding period is exactly when implied "
+                    "volatility collapses — the Options tab now warns about this."
+                )
+
+        else:
+            a = narrow(actions)
+            if a.empty:
+                st.info("No corporate actions stored for this selection.")
+            else:
+                today = pd.Timestamp(datetime.now().date())
+                a = a[a["EX_DATE"] >= today].sort_values("EX_DATE")
+                st.caption(f"{len(a):,} upcoming ex-dates")
+                st.dataframe(a, use_container_width=True, height=460, hide_index=True)
+                st.caption(
+                    "Price drops by roughly the dividend on the ex-date. That is "
+                    "not a loss, but it will show up as one on any chart."
+                )
+
+
+with tab_journal, safe_tab("Journal"):
+    st.markdown("#### Trade journal")
+    st.markdown(
+        "Log what you took and why, before you know the outcome. Six months of "
+        "this tells you which setups work **for you**, which no generic backtest "
+        "can — and it catches the thing memory always hides: that you took the "
+        "trade for a different reason than you now remember."
+    )
+
+    journal = load_journal()
+    scored = score_journal(journal, cached_history())
+    stats = journal_stats(scored)
+
+    if stats:
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Closed trades", stats["closed"])
+        m2.metric("Hit rate",
+                  f"{stats['hit_rate']:.0f}%" if stats["hit_rate"] == stats["hit_rate"] else "—")
+        m3.metric("Median return",
+                  f"{stats['median_return']:+.1f}%" if stats["median_return"] == stats["median_return"] else "—")
+        m4.metric("Average R",
+                  f"{stats['avg_r']:+.2f}" if stats["avg_r"] == stats["avg_r"] else "—",
+                  help="Profit as a multiple of the risk you planned. Above 0.3 "
+                       "over many trades is a real result.")
+
+        if stats["closed"] < 20:
+            st.markdown(
+                f'<div class="stale">Only {stats["closed"]} closed trades. Nothing '
+                'here is a result yet — hit rate over a handful of trades is noise, '
+                'and the temptation to conclude something from it is the main way '
+                'journals mislead. Thirty or more before you read anything into '
+                'the numbers.</div>', unsafe_allow_html=True)
+
+    if not scored.empty:
+        by_setup = scored[scored["Status"] == "closed"]
+        if len(by_setup) >= 3:
+            st.markdown("**By setup**")
+            agg = by_setup.groupby("Setup").agg(
+                Trades=("Return %", "size"),
+                **{"Hit rate %": ("Return %", lambda s: (s > 0).mean() * 100)},
+                **{"Median %": ("Return %", "median")},
+                **{"Avg R": ("R multiple", "mean")}).reset_index()
+            st.dataframe(agg.style.format(precision=2, na_rep="—"),
+                         use_container_width=True, hide_index=True)
+
+        st.markdown("**All entries**")
+        st.dataframe(colour_frame(scored, ["Return %", "P&L", "R multiple"]),
+                     column_config=help_config(scored),
+                     use_container_width=True, height=360, hide_index=True)
+
+    st.divider()
+    st.markdown("**Log a trade**")
+    st.caption(
+        "Fill in the thesis and invalidation before you know the outcome — those "
+        "two columns are the entire value of this. Download and commit the file "
+        "to your repo to keep it."
+    )
+
+    edited_j = st.data_editor(
+        journal if not journal.empty else pd.DataFrame(
+            [{c: "" for c in JOURNAL_COLUMNS}]),
+        num_rows="dynamic", use_container_width=True, key="journal_editor",
+        column_config={
+            "date": st.column_config.TextColumn("Date", help="YYYY-MM-DD"),
+            "symbol": st.column_config.TextColumn("Symbol"),
+            "setup": st.column_config.SelectboxColumn(
+                "Setup", options=["Range breakout", "52-week high breakout",
+                                  "Pullback to 50DMA", "Oversold in uptrend",
+                                  "Delivery accumulation", "Breakdown",
+                                  "Fundamental", "Options", "Other"]),
+            "bias": st.column_config.SelectboxColumn("Bias", options=["long", "short"]),
+            "entry": st.column_config.NumberColumn("Entry", format="%.2f"),
+            "stop": st.column_config.NumberColumn("Stop", format="%.2f"),
+            "target": st.column_config.NumberColumn("Target", format="%.2f"),
+            "qty": st.column_config.NumberColumn("Qty", format="%d"),
+            "thesis": st.column_config.TextColumn("Why I took it", width="large"),
+            "invalidation": st.column_config.TextColumn(
+                "What would prove me wrong", width="large"),
+            "status": st.column_config.SelectboxColumn("Status", options=["open", "closed"]),
+            "exit_price": st.column_config.NumberColumn("Exit", format="%.2f"),
+            "exit_date": st.column_config.TextColumn("Exit date"),
+            "notes": st.column_config.TextColumn("Notes after the fact", width="large"),
+        })
+
+    st.download_button("Download journal.csv",
+                       data=edited_j.to_csv(index=False).encode("utf-8"),
+                       file_name="journal.csv", mime="text/csv", key="jr_dl",
+                       help="Upload to data/ in your repo to make it permanent.")
 
 
 with tab_hunt, safe_tab("Small-cap hunt"):
