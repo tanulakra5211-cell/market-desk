@@ -30,7 +30,7 @@ st.set_page_config(
 )
 
 DATA_DIR = Path(__file__).parent / "data"
-APP_VERSION = "v11 — glossary"
+APP_VERSION = "v12 — 52w range"
 
 
 # ============================================================ DEFAULT DATA ===
@@ -1889,13 +1889,34 @@ def screen_from_history(hist: pd.DataFrame):
         "Delivery %": day["DELIV_PER"].values if "DELIV_PER" in day.columns else float("nan"),
     })
 
-    # 1-month change against the closest stored date ~21 sessions back
     dates = sorted(hist["DATE"].unique())
-    if len(dates) > 21:
-        base_date = dates[-22]
-        base = hist[hist["DATE"] == base_date].set_index("SYMBOL")["CLOSE"]
-        out["1M %"] = ((out["Close"].values - base.reindex(out["Symbol"]).values)
-                       / base.reindex(out["Symbol"]).values) * 100
+
+    # Returns against earlier stored dates
+    for label, back in [("1M %", 21), ("3M %", 63), ("6M %", 126), ("1Y %", 250)]:
+        if len(dates) > back:
+            base = hist[hist["DATE"] == dates[-back - 1]].set_index("SYMBOL")["CLOSE"]
+            b = base.reindex(out["Symbol"]).values
+            out[label] = ((out["Close"].values - b) / b) * 100
+
+    # 52-week high and low, from the stored window. If fewer than ~250 trading
+    # days are on disk this is the high and low of whatever was collected, not
+    # a true year -- so the actual span is reported alongside it rather than
+    # letting the label imply more than the data supports.
+    window = hist[hist["DATE"] >= pd.Timestamp(latest_date) - pd.Timedelta(days=365)]
+    if not window.empty:
+        agg = window.groupby("SYMBOL")["CLOSE"].agg(["max", "min"])
+        hi = agg["max"].reindex(out["Symbol"]).values
+        lo = agg["min"].reindex(out["Symbol"]).values
+        out["52W High"] = hi
+        out["52W Low"] = lo
+        out["Off 52W High %"] = ((out["Close"].values - hi) / hi) * 100
+        out["Above 52W Low %"] = ((out["Close"].values - lo) / lo) * 100
+        # Guard the divide: a stock that never moved has zero span.
+        import numpy as np
+        span = np.where((hi - lo) == 0, np.nan, hi - lo)
+        out["52W position %"] = ((out["Close"].values - lo) / span) * 100
+
+        out.attrs["hl_days"] = int(window["DATE"].nunique())
 
     return out.reset_index(drop=True), pd.Timestamp(latest_date).date()
 
@@ -2615,7 +2636,19 @@ with tab_screen, safe_tab("Screener"):
             else:
                 st.write("No attempts recorded.")
     else:
-        st.caption(f"{len(screen):,} stocks · trading day {screen_date}")
+        hl_days = screen.attrs.get("hl_days")
+        st.caption(
+            f"{len(screen):,} stocks · trading day {screen_date}"
+            + (f" · 52-week columns computed from {hl_days} stored trading days"
+               if hl_days else "")
+        )
+        if hl_days and hl_days < 240:
+            st.markdown(
+                f'<div class="stale">Only {hl_days} trading days are on disk, so '
+                'the "52 week" high and low are really the high and low of that '
+                'shorter window. They become true 52-week figures once the '
+                'collector has banked a full year.</div>',
+                unsafe_allow_html=True)
 
         breadth = market_breadth(screen)
         if breadth:
@@ -2648,9 +2681,15 @@ with tab_screen, safe_tab("Screener"):
         max_price = f4.number_input("Max price (0 = no cap)", value=0.0, step=100.0,
                                     key="scr_maxpx")
 
-        g1, g2 = st.columns(2)
+        g1, g2, g3, g4 = st.columns(4)
         move_min = g1.number_input("Min day % move", value=-100.0, step=1.0, key="scr_movemin")
         move_max = g2.number_input("Max day % move", value=100.0, step=1.0, key="scr_movemax")
+        near_high = g3.number_input("Within % of 52W high", value=0.0, step=1.0,
+                                    key="scr_nearhigh",
+                                    help="0 disables. Enter 5 to see stocks within "
+                                         "5% of their yearly high.")
+        near_low = g4.number_input("Within % of 52W low", value=0.0, step=1.0,
+                                   key="scr_nearlow", help="0 disables.")
 
         view = screen.copy()
         view = view[view["Turnover (Cr)"].fillna(0) >= min_turnover]
@@ -2661,9 +2700,15 @@ with tab_screen, safe_tab("Screener"):
         if max_price > 0:
             view = view[view["Close"].fillna(1e12) <= max_price]
         view = view[view["Day %"].between(move_min, move_max, inclusive="both")]
+        if near_high > 0 and "Off 52W High %" in view.columns:
+            view = view[view["Off 52W High %"].fillna(-1e9) >= -near_high]
+        if near_low > 0 and "Above 52W Low %" in view.columns:
+            view = view[view["Above 52W Low %"].fillna(1e9) <= near_low]
 
-        sort_options = [c for c in ["Turnover (Cr)", "Day %", "1M %", "Delivery %",
-                                    "Volume", "Close"] if c in view.columns]
+        sort_options = [c for c in ["Turnover (Cr)", "Day %", "1M %", "3M %",
+                                    "6M %", "1Y %", "Delivery %", "Volume", "Close",
+                                    "Off 52W High %", "Above 52W Low %",
+                                    "52W position %"] if c in view.columns]
         s1, s2 = st.columns([3, 1])
         sort_by = s1.selectbox("Sort by", options=sort_options, key="scr_sort")
         descending = s2.checkbox("Descending", value=True)
