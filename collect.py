@@ -78,6 +78,10 @@ def fetch_day(client: httpx.Client, date: datetime, diag: list) -> pd.DataFrame:
     try:
         resp = client.get(url, headers=archive_headers)
         diag.append(resp.status_code)
+        if resp.status_code == 200 and len(resp.content) < 500:
+            # NSE answers 200 with a stub for dates outside its retention window.
+            diag.append(f"200-but-{len(resp.content)}B: "
+                        f"{resp.content[:120]!r}")
         if resp.status_code == 200 and not resp.content[:20].lstrip().lower().startswith(b"<"):
             df = pd.read_csv(io.StringIO(resp.text))
             df.columns = [c.strip() for c in df.columns]
@@ -191,18 +195,24 @@ def main() -> int:
     print(f"Fetching {len(days)} trading day(s)…")
     client = make_client()
     stored = failed = 0
+    consecutive_misses = 0
+    oldest_stored = "—"
     statuses: dict = {}
 
-    for n, day in enumerate(sorted(days)):
+    # Newest first. Recent files are the ones that exist and the ones you need;
+    # NSE drops older security-wise files out of the archive entirely.
+    for n, day in enumerate(sorted(days, reverse=True)):
         label = day.strftime("%Y-%m-%d")
         diag: list = []
         df = fetch_day(client, day, diag)
         for code in diag:
-            statuses[code] = statuses.get(code, 0) + 1
+            key = code if isinstance(code, int) else str(code)[:40]
+            statuses[key] = statuses.get(key, 0) + 1
 
         if df.empty:
             print(f"  {label}: no data (HTTP {diag or 'error'})")
             failed += 1
+            consecutive_misses += 1
             # Re-prime the session periodically -- cookies expire mid-run.
             if failed % 25 == 0:
                 print("    re-priming session…")
@@ -215,11 +225,21 @@ def main() -> int:
             store(df)
             print(f"  {label}: {len(df):,} stocks stored")
             stored += 1
+            consecutive_misses = 0
+            oldest_stored = label
 
-        # Bail out early if NSE is clearly refusing everything, rather than
-        # spending ten minutes proving it.
-        if n >= 14 and stored == 0:
-            print("\nAborting: 15 consecutive days returned nothing.")
+        # If the ten most recent trading days all fail, something is genuinely
+        # wrong. Failures further back just mean the archive doesn't go that
+        # far, which is expected and not a reason to stop.
+        if n == 9 and stored == 0:
+            print("\nAborting: the 10 most recent trading days all failed.")
+            break
+
+        # Stop once we're clearly past the archive's retention window.
+        if stored > 0 and consecutive_misses >= 30:
+            print(f"\nStopping: {consecutive_misses} consecutive days unavailable "
+                  f"— past the end of NSE's archive. Collected back to "
+                  f"{oldest_stored}.")
             break
 
         time.sleep(0.4)  # stay under NSE's ~3 req/sec limit
@@ -227,14 +247,14 @@ def main() -> int:
     client.close()
 
     print(f"\nDone. {stored} day(s) stored, {failed} unavailable.")
-    print("HTTP status counts:", dict(sorted(statuses.items())) or "none recorded")
+    print(f"Oldest date collected: {oldest_stored}")
+    print("HTTP status counts:", statuses or "none recorded")
 
     if stored == 0:
         print(
-            "\nNothing was stored. If the statuses above are mostly 403, NSE is "
-            "blocking this server's IP range and the collector needs to run "
-            "somewhere else -- see README. If they are 404, the URL pattern is "
-            "wrong. If no statuses appear at all, the initial handshake failed."
+            "\nNothing was stored. 403 means the IP range is blocked. 404 means "
+            "the file does not exist for those dates. A 200 with a tiny body "
+            "means NSE served a placeholder -- the sample above shows what."
         )
     # Exit 0 unless nothing at all was stored, so one bad day doesn't turn the
     # whole schedule red.
