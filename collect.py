@@ -222,10 +222,13 @@ def main() -> int:
     days = [d for d in days if d.strftime("%Y-%m-%d") not in have]
 
     if not days:
-        print("Already up to date, nothing to fetch.")
+        print(f"Already up to date — {len(have)} trading days already stored, "
+              "nothing new to fetch.")
         return 0
 
-    print(f"Fetching {len(days)} trading day(s)…")
+    if have:
+        print(f"{len(have)} trading day(s) already stored.")
+    print(f"Fetching {len(days)} trading day(s) not yet on disk…")
     client = make_client()
     stored = failed = 0
     consecutive_misses = 0
@@ -288,14 +291,27 @@ def main() -> int:
     print("HTTP status counts:", statuses or "none recorded")
 
     if stored == 0:
+        codes = [k for k in statuses if isinstance(k, int)]
+        # A 404 means the file does not exist for that date -- which is exactly
+        # what a market holiday looks like. That is a correct outcome, not a
+        # failure, so it must not turn the scheduled run red.
+        only_missing = bool(codes) and all(c == 404 for c in codes)
+        if only_missing:
+            print(
+                "Every requested date returned 404, i.e. no file exists for them. "
+                "On an up-to-date store the only dates left unfetched are market "
+                "holidays, so this is the expected result and not an error."
+            )
+            return 0
+
         print(
-            "\nNothing was stored. 403 means the IP range is blocked. 404 means "
-            "the file does not exist for those dates. A 200 with a tiny body "
-            "means NSE served a placeholder -- the sample above shows what."
+            "\nNothing was stored and not everything was a 404. 403 means the IP "
+            "range is blocked. A 200 with a tiny body means NSE served a "
+            "placeholder -- the sample above shows what."
         )
-    # Exit 0 unless nothing at all was stored, so one bad day doesn't turn the
-    # whole schedule red.
-    return 1 if stored == 0 else 0
+        return 1
+
+    return 0
 
 
 if __name__ == "__main__":
