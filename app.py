@@ -30,7 +30,7 @@ st.set_page_config(
 )
 
 DATA_DIR = Path(__file__).parent / "data"
-APP_VERSION = "v14 — disclosures & journal"
+APP_VERSION = "v15 — ownership"
 
 
 # ============================================================ DEFAULT DATA ===
@@ -2666,12 +2666,117 @@ def journal_stats(scored: pd.DataFrame) -> dict:
     }
 
 
+# ========================================================== SHAREHOLDING =====
+# A single quarter's filing tells you little. The trend across quarters is the
+# point: promoter stake creeping up, or institutional holding stepping from 2%
+# to 9% in a smallcap. These are slow signals, which is exactly why they
+# survive being public — nobody can act on them fast enough to arbitrage them
+# away, and most people never assemble the history at all.
+
+SHP_PATH = DATA_DIR / "shareholding.csv"
+MF_PATH = DATA_DIR / "mf_holdings.csv"
+
+SHP_CATEGORIES = ["PROMOTER_%", "PLEDGED_%", "FII_%", "DII_%", "MF_%", "PUBLIC_%"]
+
+
+def _parse_period(value):
+    """Filings label quarters inconsistently. Try hard, give up cleanly."""
+    s = str(value).strip()
+    for fmt in ("%d-%b-%Y", "%d-%m-%Y", "%Y-%m-%d", "%b-%Y", "%d %b %Y"):
+        try:
+            return pd.Timestamp(datetime.strptime(s, fmt))
+        except ValueError:
+            continue
+    parsed = pd.to_datetime(s, errors="coerce", dayfirst=True)
+    return parsed if pd.notna(parsed) else pd.NaT
+
+
+@st.cache_data(ttl=3600)
+def load_shareholding() -> pd.DataFrame:
+    if not SHP_PATH.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(SHP_PATH, skipinitialspace=True)
+    except Exception:
+        return pd.DataFrame()
+    df["PERIOD_DT"] = df["PERIOD"].map(_parse_period)
+    for c in SHP_CATEGORIES:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df.sort_values(["SYMBOL", "PERIOD_DT"])
+
+
+@st.cache_data(ttl=3600)
+def load_mf_links() -> pd.DataFrame:
+    if not MF_PATH.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(MF_PATH, skipinitialspace=True)
+    except Exception:
+        return pd.DataFrame()
+
+
+def ownership_trends(shp: pd.DataFrame, quarters: int = 4) -> pd.DataFrame:
+    """
+    Change in each ownership category over the last N filed quarters.
+
+    Reports how many quarters each figure is actually based on, because a
+    'trend' computed from two filings is not a trend and should not be
+    presented as one.
+    """
+    if shp.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for sym, g in shp.groupby("SYMBOL"):
+        g = g.dropna(subset=["PERIOD_DT"]).sort_values("PERIOD_DT")
+        if g.empty:
+            continue
+        window = g.tail(quarters)
+        latest = window.iloc[-1]
+        first = window.iloc[0]
+        n = len(window)
+
+        row = {"Symbol": sym, "Latest filing": latest["PERIOD"], "Quarters": n}
+        for cat in SHP_CATEGORIES:
+            if cat not in g.columns:
+                continue
+            now, then = latest.get(cat), first.get(cat)
+            label = cat.replace("_%", "")
+            row[f"{label} now %"] = now
+            row[f"{label} change"] = (now - then) if (now == now and then == then
+                                                      and n > 1) else float("nan")
+        rows.append(row)
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+
+    # Accumulation score: institutions and promoters adding, pledging falling.
+    parts = []
+    for col, weight in [("FII change", 1), ("DII change", 1), ("MF change", 1),
+                        ("PROMOTER change", 2), ("PLEDGED change", -2)]:
+        if col in out.columns:
+            parts.append(out[col].fillna(0) * weight)
+    if parts:
+        out["Accumulation score"] = sum(parts)
+    return out.sort_values("Accumulation score", ascending=False,
+                           na_position="last")
+
+
 # ============================================================== GLOSSARY =====
 # Every term the app shows, in plain English. Definitions say what a number
 # measures AND what it does not tell you -- the second half is usually the
 # part that costs money.
 
 GLOSSARY = {
+    "Quarters": "How many filed quarters the change is computed from. Two is a comparison, not a trend.",
+    "Accumulation score": "A weighted sum of ownership changes: promoter and institutional increases add, rising pledges subtract. Not a verdict — it cannot tell why a stake moved.",
+    "MF %": "Mutual fund ownership as a percentage of equity. Rising MF holding in a smallcap means professional money is building a position.",
+    "DII %": "Domestic institutional ownership — Indian funds, insurers, pension money.",
+    "FII %": "Foreign institutional ownership as a percentage of equity.",
+    "Pledged": "The share of promoter holding put up as loan collateral. If the price falls far enough the lender can sell, turning a decline into forced selling. No ratio screen can see this.",
+    "Promoter": "The founding or controlling shareholders. A rising promoter stake bought in the open market is one of the few genuinely informative signals in a small cap.",
     "Board meeting": "When results are approved. For options, a date inside your holding period is when implied volatility collapses.",
     "Ex-date": "The date from which a buyer no longer receives the dividend. Price drops by roughly the dividend — not a loss, but it looks like one on a chart.",
     "R multiple": "Profit as a multiple of the risk you planned. Above 0.3 over many trades is a real result; a single high R is luck.",
@@ -3002,12 +3107,12 @@ st.markdown(f'<div class="pulse-strip">{"".join(cells)}</div>', unsafe_allow_htm
 
 # ================================================================= TABS ======
 
-(tab_market, tab_setups, tab_screen, tab_tech, tab_opt, tab_disc, tab_journal,
- tab_hunt, tab_test, tab_news, tab_flows, tab_ratios, tab_book,
+(tab_market, tab_setups, tab_screen, tab_tech, tab_opt, tab_disc, tab_own,
+ tab_journal, tab_hunt, tab_test, tab_news, tab_flows, tab_ratios, tab_book,
  tab_depth) = st.tabs(
     ["Markets", "Weekly setups", "Screener (all NSE)", "Technicals", "Options",
-     "Disclosures", "Journal", "Small-cap hunt", "Backtest", "News", "FII / DII",
-     "Ratios", "Order Book", "Depth"]
+     "Disclosures", "Ownership", "Journal", "Small-cap hunt", "Backtest", "News",
+     "FII / DII", "Ratios", "Order Book", "Depth"]
 )
 
 with tab_market, safe_tab("Markets"):
@@ -4186,6 +4291,122 @@ with tab_disc, safe_tab("Disclosures"):
                     "Price drops by roughly the dividend on the ex-date. That is "
                     "not a loss, but it will show up as one on any chart."
                 )
+
+
+with tab_own, safe_tab("Ownership"):
+    st.markdown("#### Who owns it, and who is buying")
+    st.markdown(
+        "Quarterly shareholding filings, assembled into a history. A single "
+        "quarter tells you little; three quarters of a promoter adding, or "
+        "institutional holding stepping from 2% to 9%, is a slow signal — and "
+        "slow is why it survives being public."
+    )
+    glossary_panel("What do promoter, FII, DII and pledged mean?")
+
+    shp = load_shareholding()
+
+    if shp.empty:
+        st.info(
+            "No shareholding data yet. Run the *Collect bhavcopy* workflow — it "
+            "now also pulls quarterly ownership for the symbols listed in "
+            "`SHP_SYMBOLS` at the top of collect.py."
+        )
+        st.markdown(
+            '<div class="stale">This tab is the one that most rewards patience. '
+            'Every run adds the current quarter; the comparison that matters '
+            'needs three or four of them. Start now and it becomes useful around '
+            'the time you would otherwise wish you had started.</div>',
+            unsafe_allow_html=True)
+    else:
+        quarters = st.slider("Compare over how many filed quarters", 2, 8, 4,
+                             key="own_q")
+        trends = ownership_trends(shp, quarters)
+
+        if trends.empty:
+            st.warning("Filings stored but none could be parsed into periods.")
+        else:
+            thin = trends[trends["Quarters"] < 2]
+            if len(thin):
+                st.markdown(
+                    f'<div class="stale">{len(thin)} of {len(trends)} companies '
+                    'have only one filing stored, so no change can be computed for '
+                    'them. The Quarters column shows what each row is based on — '
+                    'a change from two filings is a comparison, not a trend.</div>',
+                    unsafe_allow_html=True)
+
+            st.caption(f"{len(trends)} companies · latest filings "
+                       f"{shp['PERIOD_DT'].max():%b %Y}" if shp["PERIOD_DT"].notna().any()
+                       else f"{len(trends)} companies")
+
+            chg_cols = [c for c in trends.columns if c.endswith("change")]
+            st.dataframe(
+                colour_frame(trends, chg_cols + ["Accumulation score"]),
+                column_config=help_config(trends),
+                use_container_width=True, height=420, hide_index=True)
+
+            st.markdown(
+                '<div class="stale"><b>The Accumulation score is a weighted sum, '
+                'not a verdict.</b> It adds promoter and institutional increases '
+                'and subtracts rising pledges. It cannot tell why a stake moved — '
+                'a promoter selling to fund an acquisition and one selling because '
+                'they have lost faith look identical here. Read the filing before '
+                'concluding anything.</div>', unsafe_allow_html=True)
+
+            st.divider()
+            st.markdown("**One company over time**")
+            own_pick = st.selectbox("Company", sorted(shp["SYMBOL"].unique()),
+                                    key="own_pick")
+            g = shp[shp["SYMBOL"] == own_pick].dropna(subset=["PERIOD_DT"])
+            g = g.sort_values("PERIOD_DT")
+
+            if len(g) < 2:
+                st.info("Only one filing stored for this company so far.")
+            else:
+                avail = [c for c in SHP_CATEGORIES if c in g.columns
+                         and g[c].notna().any()]
+                show = st.multiselect("Categories", avail,
+                                      default=[c for c in avail
+                                               if c in ("PROMOTER_%", "FII_%",
+                                                        "DII_%", "PLEDGED_%")],
+                                      key="own_cats")
+                if show:
+                    chart = g.set_index("PERIOD_DT")[show]
+                    st.line_chart(chart, height=300)
+                st.dataframe(
+                    g[["PERIOD"] + avail].sort_values("PERIOD", ascending=False),
+                    use_container_width=True, hide_index=True)
+
+                if "PLEDGED_%" in g.columns and g["PLEDGED_%"].notna().any():
+                    latest_pledge = g["PLEDGED_%"].dropna().iloc[-1]
+                    if latest_pledge > 20:
+                        st.markdown(
+                            f'<div class="stale"><b>{latest_pledge:.1f}% of promoter '
+                            'holding is pledged.</b> Pledged shares can be sold by '
+                            'the lender if the price falls far enough, which turns '
+                            'a decline into a forced-selling spiral. This is the '
+                            'risk no ratio screen can see.</div>',
+                            unsafe_allow_html=True)
+
+    st.divider()
+    st.markdown("**Mutual fund portfolio disclosures**")
+    mf = load_mf_links()
+    if mf.empty:
+        st.caption("No AMFI disclosure links collected yet.")
+    else:
+        st.caption(f"{len(mf)} disclosure files published by AMCs.")
+        st.dataframe(mf.tail(40), use_container_width=True, height=260,
+                     hide_index=True)
+
+    st.markdown(
+        '<div class="stale"><b>Why these are links rather than data.</b> AMFI '
+        'publishes an index, but each AMC then posts its own spreadsheet in its '
+        'own layout — there is no common schema across forty-odd houses. Parsing '
+        'them reliably is per-AMC work that breaks whenever one changes its '
+        'template, so this collects the links rather than pretending to a '
+        'standardisation that does not exist. For the question that actually '
+        'matters — how much of a company funds own, and whether that is rising — '
+        'the MF column in the shareholding table above is both reliable and '
+        'already assembled.</div>', unsafe_allow_html=True)
 
 
 with tab_journal, safe_tab("Journal"):
