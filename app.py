@@ -10,6 +10,7 @@ Run locally:  streamlit run app.py
 
 import io
 import time
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -434,84 +435,140 @@ UDIFF_URL = (
 )
 
 
-def fetch_nse_universe() -> pd.DataFrame:
-    """Every equity listed on NSE: symbol, name, series, listing date, ISIN."""
+def _archive_get(url: str):
+    """
+    GET a file from nsearchives. These need a Referer pointing at the reports
+    page rather than the API referer used for /api/ endpoints, otherwise NSE
+    returns 403. Returns (response | None, status_note).
+    """
     sess = get_nse_session()
     try:
         if not sess._primed:
             sess._prime()
-        resp = sess._client.get(EQUITY_LIST_URL)
-        resp.raise_for_status()
+    except Exception as exc:  # noqa: BLE001
+        return None, f"session priming failed: {exc}"
+
+    headers = {
+        "Referer": "https://www.nseindia.com/all-reports",
+        "Accept": "text/csv,application/zip,application/octet-stream,*/*",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-site",
+    }
+    try:
+        resp = sess._client.get(url, headers=headers)
+        if resp.status_code != 200:
+            return None, f"HTTP {resp.status_code}"
+        if len(resp.content) < 200:
+            return None, f"empty response ({len(resp.content)} bytes)"
+        return resp, "ok"
+    except Exception as exc:  # noqa: BLE001
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def fetch_nse_universe() -> pd.DataFrame:
+    """Every equity listed on NSE: symbol, name, series, listing date, ISIN."""
+    resp, _ = _archive_get(EQUITY_LIST_URL)
+    if resp is None:
+        return pd.DataFrame()
+    try:
         df = pd.read_csv(io.StringIO(resp.text))
     except Exception:
         return pd.DataFrame()
 
     df.columns = [c.strip() for c in df.columns]
     rename = {
-        "SYMBOL": "Symbol",
-        "NAME OF COMPANY": "Company",
-        "SERIES": "Series",
-        " SERIES": "Series",
-        "DATE OF LISTING": "Listed",
-        " DATE OF LISTING": "Listed",
-        "ISIN NUMBER": "ISIN",
-        " ISIN NUMBER": "ISIN",
-        "FACE VALUE": "Face Value",
-        " FACE VALUE": "Face Value",
+        "SYMBOL": "Symbol", "NAME OF COMPANY": "Company", "SERIES": "Series",
+        "DATE OF LISTING": "Listed", "ISIN NUMBER": "ISIN", "FACE VALUE": "Face Value",
     }
     df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
     keep = [c for c in ["Symbol", "Company", "Series", "Listed", "ISIN"] if c in df.columns]
     return df[keep]
 
 
-def _fetch_bhav_for(date: datetime) -> pd.DataFrame:
-    """One trading day's full-market data. Empty frame if not a trading day."""
-    sess = get_nse_session()
-    try:
-        if not sess._primed:
-            sess._prime()
-    except Exception:
-        return pd.DataFrame()
+def _normalise_udiff(df: pd.DataFrame) -> pd.DataFrame:
+    """Map UDiFF column names onto the sec_bhavdata_full shape."""
+    df = df[df.get("FinInstrmTp", "STK") == "STK"].copy()
+    out = pd.DataFrame({
+        "SYMBOL": df["TckrSymb"],
+        "SERIES": df.get("SctySrs", "EQ"),
+        "CLOSE_PRICE": pd.to_numeric(df["ClsPric"], errors="coerce"),
+        "PREV_CLOSE": pd.to_numeric(df["PrvsClsgPric"], errors="coerce"),
+        "TTL_TRD_QNTY": pd.to_numeric(df["TtlTradgVol"], errors="coerce"),
+        "TURNOVER_LACS": pd.to_numeric(df["TtlTrfVal"], errors="coerce") / 1e5,
+        "NO_OF_TRADES": pd.to_numeric(df.get("TtlNbOfTxsExctd"), errors="coerce"),
+        "DELIV_PER": float("nan"),  # not carried in UDiFF
+    })
+    return out
 
+
+def _fetch_bhav_for(date: datetime, attempts: list | None = None) -> pd.DataFrame:
+    """
+    One trading day's full-market data.
+
+    Tries the security-wise file first (it carries delivery %), then falls back
+    to the UDiFF common bhavcopy zip. Every attempt is recorded in `attempts`
+    so the UI can show what actually happened.
+    """
+    if attempts is None:
+        attempts = []
+
+    # 1. Security-wise full bhavcopy -- includes DELIV_PER.
     url = SEC_BHAV_URL.format(ddmmyyyy=date.strftime("%d%m%Y"))
-    try:
-        resp = sess._client.get(url)
-        if resp.status_code != 200:
-            return pd.DataFrame()
-        df = pd.read_csv(io.StringIO(resp.text))
-    except Exception:
-        return pd.DataFrame()
+    resp, note = _archive_get(url)
+    attempts.append((date.strftime("%d-%b-%Y"), "sec_bhavdata_full", note))
+    if resp is not None:
+        try:
+            df = pd.read_csv(io.StringIO(resp.text))
+            df.columns = [c.strip() for c in df.columns]
+            for col in df.columns:
+                if df[col].dtype == object:
+                    df[col] = df[col].astype(str).str.strip()
+            for col in ["PREV_CLOSE", "OPEN_PRICE", "HIGH_PRICE", "LOW_PRICE",
+                        "LAST_PRICE", "CLOSE_PRICE", "AVG_PRICE", "TTL_TRD_QNTY",
+                        "TURNOVER_LACS", "NO_OF_TRADES", "DELIV_QTY", "DELIV_PER"]:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+            df["TRADE_DATE"] = date.date()
+            return df
+        except Exception as exc:  # noqa: BLE001
+            attempts.append((date.strftime("%d-%b-%Y"), "sec parse", str(exc)[:80]))
 
-    df.columns = [c.strip() for c in df.columns]
-    for col in df.columns:
-        if df[col].dtype == object:
-            df[col] = df[col].astype(str).str.strip()
+    # 2. UDiFF common bhavcopy zip -- no delivery data, but reliable.
+    url = UDIFF_URL.format(yyyymmdd=date.strftime("%Y%m%d"))
+    resp, note = _archive_get(url)
+    attempts.append((date.strftime("%d-%b-%Y"), "UDiFF zip", note))
+    if resp is not None:
+        try:
+            with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                name = zf.namelist()[0]
+                raw = pd.read_csv(zf.open(name))
+            raw.columns = [c.strip() for c in raw.columns]
+            df = _normalise_udiff(raw)
+            df["TRADE_DATE"] = date.date()
+            return df
+        except Exception as exc:  # noqa: BLE001
+            attempts.append((date.strftime("%d-%b-%Y"), "UDiFF parse", str(exc)[:80]))
 
-    numeric = ["PREV_CLOSE", "OPEN_PRICE", "HIGH_PRICE", "LOW_PRICE", "LAST_PRICE",
-               "CLOSE_PRICE", "AVG_PRICE", "TTL_TRD_QNTY", "TURNOVER_LACS",
-               "NO_OF_TRADES", "DELIV_QTY", "DELIV_PER"]
-    for col in numeric:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    df["TRADE_DATE"] = date.date()
-    return df
+    return pd.DataFrame()
 
 
 def fetch_latest_bhavcopy(max_lookback: int = 7):
     """
-    Walk backwards from today until a trading day's file is found.
-    Returns (dataframe, date) or (empty, None).
+    Walk backwards until a trading day's file is found.
+    Returns (dataframe, date, attempts).
     """
+    attempts: list = []
     for offset in range(max_lookback):
         day = datetime.now() - timedelta(days=offset)
         if day.weekday() >= 5:
+            attempts.append((day.strftime("%d-%b-%Y"), "skipped", "weekend"))
             continue
-        df = _fetch_bhav_for(day)
+        df = _fetch_bhav_for(day, attempts)
         if not df.empty:
-            return df, day.date()
+            return df, day.date(), attempts
         time.sleep(0.4)
-    return pd.DataFrame(), None
+    return pd.DataFrame(), None, attempts
 
 
 def build_market_screen(latest: pd.DataFrame, prior: pd.DataFrame) -> pd.DataFrame:
@@ -814,10 +871,10 @@ def load_universe():
 
 @st.cache_data(ttl=3600)
 def load_market_screen():
-    """Whole-market table plus the date it represents."""
-    latest, latest_date = fetch_latest_bhavcopy()
+    """Whole-market table, the date it represents, and the fetch attempt log."""
+    latest, latest_date, attempts = fetch_latest_bhavcopy()
     if latest.empty:
-        return pd.DataFrame(), None
+        return pd.DataFrame(), None, attempts
 
     prior = pd.DataFrame()
     for offset in range(30, 38):
@@ -840,7 +897,7 @@ def load_market_screen():
         ]
         screen = screen[cols]
 
-    return screen, latest_date
+    return screen, latest_date, attempts
 
 
 # ============================================================== HELPERS ======
@@ -984,15 +1041,28 @@ with tab_screen:
     )
 
     with st.spinner("Loading full market…"):
-        screen, screen_date = load_market_screen()
+        screen, screen_date, attempts = load_market_screen()
 
     if screen.empty:
         st.markdown(
-            '<div class="stale">NSE did not return the bhavcopy. The file publishes '
-            'after market close on trading days, and NSE refuses cloud-host requests '
-            'intermittently. Try Refresh, or check back after 7pm IST.</div>',
+            '<div class="stale">Could not retrieve the bhavcopy. It publishes after '
+            'market close on trading days, and NSE refuses cloud-host requests '
+            'intermittently. The log below shows exactly what was tried.</div>',
             unsafe_allow_html=True,
         )
+        with st.expander("Fetch log", expanded=True):
+            if attempts:
+                st.dataframe(
+                    pd.DataFrame(attempts, columns=["Date", "File", "Result"]),
+                    use_container_width=True, hide_index=True,
+                )
+                st.caption(
+                    "HTTP 403 means NSE blocked this server. HTTP 404 means no file "
+                    "for that date, which is normal on holidays. A session error "
+                    "means NSE refused the initial handshake."
+                )
+            else:
+                st.write("No attempts recorded.")
     else:
         st.caption(f"{len(screen):,} stocks · trading day {screen_date}")
 
