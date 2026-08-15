@@ -393,7 +393,7 @@ def fetch_fno_participant_oi() -> pd.DataFrame:
         f"fao_participant_oi_{date_str}.csv"
     )
     try:
-        df = pd.read_csv(url, skiprows=1)
+        df = pd.read_csv(url, skiprows=1, skipinitialspace=True)
         df.columns = [c.strip() for c in df.columns]
         return df
     except Exception:
@@ -475,7 +475,7 @@ def fetch_nse_universe() -> pd.DataFrame:
     if resp is None:
         return pd.DataFrame()
     try:
-        df = pd.read_csv(io.StringIO(resp.text))
+        df = pd.read_csv(io.StringIO(resp.text), skipinitialspace=True)
     except Exception:
         return pd.DataFrame()
 
@@ -522,10 +522,10 @@ def _fetch_bhav_for(date: datetime, attempts: list | None = None) -> pd.DataFram
     attempts.append((date.strftime("%d-%b-%Y"), "sec_bhavdata_full", note))
     if resp is not None:
         try:
-            df = pd.read_csv(io.StringIO(resp.text))
+            df = pd.read_csv(io.StringIO(resp.text), skipinitialspace=True)
             df.columns = [c.strip() for c in df.columns]
             for col in df.columns:
-                if df[col].dtype == object:
+                if not pd.api.types.is_numeric_dtype(df[col]):
                     df[col] = df[col].astype(str).str.strip()
             for col in ["PREV_CLOSE", "OPEN_PRICE", "HIGH_PRICE", "LOW_PRICE",
                         "LAST_PRICE", "CLOSE_PRICE", "AVG_PRICE", "TTL_TRD_QNTY",
@@ -545,7 +545,7 @@ def _fetch_bhav_for(date: datetime, attempts: list | None = None) -> pd.DataFram
         try:
             with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
                 name = zf.namelist()[0]
-                raw = pd.read_csv(zf.open(name))
+                raw = pd.read_csv(zf.open(name), skipinitialspace=True)
             raw.columns = [c.strip() for c in raw.columns]
             df = _normalise_udiff(raw)
             df["TRADE_DATE"] = date.date()
@@ -776,9 +776,9 @@ BACKLOG_PATH = DATA_DIR / "order_backlog.csv"
 
 def load_backlog() -> pd.DataFrame:
     if BACKLOG_PATH.exists():
-        df = pd.read_csv(BACKLOG_PATH)
+        df = pd.read_csv(BACKLOG_PATH, skipinitialspace=True)
     else:
-        df = pd.read_csv(io.StringIO(DEFAULT_BACKLOG))
+        df = pd.read_csv(io.StringIO(DEFAULT_BACKLOG), skipinitialspace=True)
     df["as_of"] = pd.to_datetime(df["as_of"], errors="coerce")
     return df.sort_values(["ticker", "as_of"])
 
@@ -828,8 +828,8 @@ def cached_backlog_analysis() -> pd.DataFrame:
 def load_watchlist() -> pd.DataFrame:
     path = DATA_DIR / "watchlist.csv"
     if path.exists():
-        return pd.read_csv(path, dtype={"bse_scrip": str})
-    return pd.read_csv(io.StringIO(DEFAULT_WATCHLIST), dtype={"bse_scrip": str})
+        return pd.read_csv(path, dtype={"bse_scrip": str}, skipinitialspace=True)
+    return pd.read_csv(io.StringIO(DEFAULT_WATCHLIST), dtype={"bse_scrip": str}, skipinitialspace=True)
 
 
 # ========================================================== TECHNICALS =======
@@ -1062,7 +1062,7 @@ def load_stored_history() -> pd.DataFrame:
     frames = []
     for f in files:
         try:
-            frames.append(pd.read_csv(f))
+            frames.append(pd.read_csv(f, skipinitialspace=True))
         except Exception:
             continue
     if not frames:
