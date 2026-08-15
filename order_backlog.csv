@@ -1,0 +1,6 @@
+ticker,company,as_of,order_book_cr,notes
+RVNL.NS,Rail Vikas Nigam,2025-09-30,97000,SAMPLE - replace with figure from investor presentation
+IRCON.NS,Ircon International,2025-09-30,22000,SAMPLE - replace with disclosed backlog
+LT.NS,Larsen and Toubro,2025-09-30,610000,SAMPLE - L&T discloses consolidated order book quarterly
+BEL.NS,Bharat Electronics,2025-09-30,74000,SAMPLE - replace after results
+NBCC.NS,NBCC India,2025-09-30,105000,SAMPLE - replace with actual

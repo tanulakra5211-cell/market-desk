@@ -1,0 +1,15 @@
+ticker,company,bse_scrip,sector
+RELIANCE.NS,Reliance Industries,500325,Energy
+HDFCBANK.NS,HDFC Bank,500180,Banking
+TCS.NS,Tata Consultancy Services,532540,IT
+INFY.NS,Infosys,500209,IT
+ICICIBANK.NS,ICICI Bank,532174,Banking
+LT.NS,Larsen and Toubro,500510,Capital Goods
+ITC.NS,ITC,500875,FMCG
+SBIN.NS,State Bank of India,500112,Banking
+BHARTIARTL.NS,Bharti Airtel,532454,Telecom
+RVNL.NS,Rail Vikas Nigam,542649,Infrastructure
+IRCON.NS,Ircon International,541956,Infrastructure
+BEL.NS,Bharat Electronics,500049,Defence
+HAL.NS,Hindustan Aeronautics,541154,Defence
+NBCC.NS,NBCC India,534309,Infrastructure
