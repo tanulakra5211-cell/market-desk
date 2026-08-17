@@ -30,7 +30,7 @@ st.set_page_config(
 )
 
 DATA_DIR = Path(__file__).parent / "data"
-APP_VERSION = "v15 — ownership"
+APP_VERSION = "v16"
 
 
 # ============================================================ DEFAULT DATA ===
@@ -1490,9 +1490,29 @@ def scan_market_patterns(hist: pd.DataFrame) -> pd.DataFrame:
     if C is None or len(C) < 60:
         return pd.DataFrame()
 
+    # Older stored files predate OHLC, so pivoting drops symbols that have no
+    # high/low at all -- leaving matrices with different column sets. Comparing
+    # two differently-labelled Series then raises. Align everything to CLOSE,
+    # which is the one column every stored row has always had.
+    def align(m):
+        if m is None:
+            return None
+        m = m.reindex(columns=C.columns)
+        return m.reindex(index=C.index)
+
+    O, H, L, V = (align(x) for x in (O, H, L, V))
+
     have_ohlc = all(x is not None and x.notna().any().any() for x in (O, H, L))
     if not have_ohlc:
         O, H, L = C, C, C   # degrade gracefully; candle patterns will be inert
+    else:
+        # Partial coverage: fill any missing OHLC with the close for that day,
+        # so a symbol with only closes still gets trend and breakout patterns
+        # rather than dropping out of the scan entirely.
+        O, H, L = O.fillna(C), H.fillna(C), L.fillna(C)
+
+    if V is None:
+        V = C * 0 + 1
 
     n = len(C)
     last = C.iloc[-1]
@@ -2282,10 +2302,15 @@ def compute_setup_inputs(hist: pd.DataFrame) -> pd.DataFrame:
     C, H, L, V, D = (wide(x) for x in ["CLOSE", "HIGH", "LOW", "VOLUME", "DELIV_PER"])
     if C is None or len(C) < 60:
         return pd.DataFrame()
-    if H is None or not H.notna().any().any():
-        H = C
-    if L is None or not L.notna().any().any():
-        L = C
+
+    # Align to CLOSE for the same reason as the pattern scan: a store that
+    # spans the schema change has OHLC for recent dates only.
+    def align(m):
+        return None if m is None else m.reindex(columns=C.columns).reindex(index=C.index)
+
+    H, L, V, D = (align(x) for x in (H, L, V, D))
+    H = C if (H is None or not H.notna().any().any()) else H.fillna(C)
+    L = C if (L is None or not L.notna().any().any()) else L.fillna(C)
 
     n = len(C)
     last = C.iloc[-1]
