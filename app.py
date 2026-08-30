@@ -30,7 +30,7 @@ st.set_page_config(
 )
 
 DATA_DIR = Path(__file__).parent / "data"
-APP_VERSION = "v16"
+APP_VERSION = "v17 — sentiment"
 
 
 # ============================================================ DEFAULT DATA ===
@@ -2789,12 +2789,289 @@ def ownership_trends(shp: pd.DataFrame, quarters: int = 4) -> pd.DataFrame:
                            na_position="last")
 
 
+# ====================================================== MARKET SENTIMENT =====
+# Composite of things that were measured, not opinions. Each component is
+# scaled to -100..+100 so they can be averaged, and each is shown separately
+# because the average hides the disagreements — and the disagreements are
+# usually the informative part.
+
+def _scale(value, low, high):
+    """Map a value onto -100..+100 across a stated range."""
+    if value is None or value != value or high == low:
+        return float("nan")
+    pos = (value - low) / (high - low)
+    return max(-100.0, min(100.0, (pos * 200) - 100))
+
+
+def sentiment_components(screen, scan, flows_df, vix_level, vix_hist=None,
+                         fno=None):
+    """
+    Return a list of (name, score, detail, note) with score in -100..+100.
+
+    A component that cannot be computed is returned as NaN rather than as a
+    neutral zero — an unknown and a genuine neutral are different things, and
+    averaging them together would be dishonest.
+    """
+    out = []
+
+    # 1. Advance/decline breadth
+    if screen is not None and not screen.empty and "Day %" in screen.columns:
+        d = screen["Day %"].dropna()
+        if len(d):
+            adv, dec = int((d > 0).sum()), int((d < 0).sum())
+            pct_up = adv / max(adv + dec, 1) * 100
+            out.append(("Advance/decline", _scale(pct_up, 30, 70),
+                        f"{adv:,} up vs {dec:,} down",
+                        "How broad today's move was, not how large."))
+
+    # 2. Share of the market above its own 50 and 200 day averages
+    if scan is not None and not scan.empty:
+        for col, label, lo, hi in [("Above 50DMA", "Above 50DMA", 25, 75),
+                                   ("Above 200DMA", "Above 200DMA", 25, 75)]:
+            if col in scan.columns:
+                pct = scan[col].fillna(False).mean() * 100
+                out.append((label, _scale(pct, lo, hi), f"{pct:.0f}% of stocks",
+                            "Participation in the trend across the whole market."))
+
+    # 3. New highs against new lows
+    if screen is not None and not screen.empty and "Off 52W High %" in screen.columns:
+        near_high = int((screen["Off 52W High %"].fillna(-99) >= -2).sum())
+        near_low = int((screen["Above 52W Low %"].fillna(99) <= 2).sum()) \
+            if "Above 52W Low %" in screen.columns else 0
+        total = near_high + near_low
+        if total >= 5:
+            pct = near_high / total * 100
+            out.append(("New highs vs lows", _scale(pct, 20, 80),
+                        f"{near_high} at highs vs {near_low} at lows",
+                        "Where the extremes are clustering."))
+
+    # 4. Volatility. Inverted: high VIX is fear, so it scores negative.
+    if vix_level == vix_level and vix_level:
+        if vix_hist is not None and len(vix_hist) > 60:
+            pctile = (vix_hist < vix_level).mean() * 100
+            score = -_scale(pctile, 20, 80)
+            detail = f"VIX {vix_level:.2f} — {pctile:.0f}th percentile of its own year"
+        else:
+            score = -_scale(vix_level, 10, 25)
+            detail = f"VIX {vix_level:.2f}"
+        out.append(("Volatility (inverted)", score, detail,
+                    "High volatility scores negative. It measures fear, "
+                    "not direction — and spikes often mark lows, not tops."))
+
+    # 5. Institutional flows
+    if flows_df is not None and not flows_df.empty:
+        summ = summarise_flows(flows_df)
+        for label in ("FII", "DII"):
+            if label in summ:
+                net = summ[label]["net"]
+                out.append((f"{label} flow", _scale(net, -3000, 3000),
+                            f"Rs {net:+,.0f} Cr net",
+                            "One session only. Direction matters more than size."))
+
+    # 6. Options positioning
+    if fno is not None and not fno.empty and "OPT" in fno.columns:
+        opts = fno[fno["OPT"].isin(["CE", "PE"])]
+        ce = pd.to_numeric(opts[opts["OPT"] == "CE"]["OI"], errors="coerce").sum()
+        pe = pd.to_numeric(opts[opts["OPT"] == "PE"]["OI"], errors="coerce").sum()
+        if ce > 0:
+            pcr = pe / ce
+            # Deliberately unscored (NaN), so it is displayed but excluded from
+            # the average. PCR's direction is genuinely contested: a high ratio
+            # reads as bearish sentiment to some and contrarian-bullish to
+            # others, and both camps have adherents. Baking a contested sign
+            # into a composite corrupts every other component in it.
+            out.append(("Put-call ratio", float("nan"), f"PCR {pcr:.2f}",
+                        "Shown but not scored. High PCR reads as bearish to "
+                        "some and contrarian-bullish to others — there is no "
+                        "settled sign, so folding it into an average would "
+                        "quietly impose one. It also largely reflects hedging "
+                        "by large holders rather than a directional view."))
+
+    # 7. Delivery breadth -- conviction rather than activity
+    if scan is not None and not scan.empty and "Delivery trend" in scan.columns:
+        dt = scan["Delivery trend"].dropna()
+        if len(dt) > 50:
+            pct = (dt > 0).mean() * 100
+            out.append(("Delivery breadth", _scale(pct, 35, 65),
+                        f"{pct:.0f}% with rising delivery",
+                        "Share of the market where more volume is being taken "
+                        "as delivery. Conviction, not activity."))
+
+    return out
+
+
+def sentiment_summary(components):
+    """Average the components that could be computed, and say how many that was."""
+    scores = [s for _, s, _, _ in components if s == s]
+    if not scores:
+        return {}
+    avg = sum(scores) / len(scores)
+    if avg >= 40:
+        label, tone = "Risk-on", "up"
+    elif avg >= 15:
+        label, tone = "Mildly positive", "up"
+    elif avg <= -40:
+        label, tone = "Risk-off", "down"
+    elif avg <= -15:
+        label, tone = "Mildly negative", "down"
+    else:
+        label, tone = "Mixed / neutral", "flat"
+
+    spread = max(scores) - min(scores)
+    return {"score": avg, "label": label, "tone": tone, "n": len(scores),
+            "spread": spread,
+            "agreement": ("Components broadly agree" if spread < 80
+                          else "Components disagree sharply")}
+
+
+def option_candidates(fno: pd.DataFrame, iv_hist: pd.DataFrame,
+                      meetings: pd.DataFrame, min_oi: float = 100000) -> pd.DataFrame:
+    """
+    Which underlyings are *suitable* for options — not which to trade.
+
+    Suitability is measurable: enough open interest that you can get filled,
+    enough strikes that you have a choice, where implied volatility sits
+    against its own history, and whether an event lands before expiry. What
+    to do with that is a judgement the data cannot make.
+    """
+    if fno.empty or "OPT" not in fno.columns:
+        return pd.DataFrame()
+
+    opts = fno[fno["OPT"].isin(["CE", "PE"])].copy()
+    for c in ("OI", "VOLUME", "STRIKE", "UNDERLYING"):
+        if c in opts.columns:
+            opts[c] = pd.to_numeric(opts[c], errors="coerce")
+
+    rows = []
+    for sym, g in opts.groupby("SYMBOL"):
+        oi = g["OI"].sum()
+        if oi < min_oi:
+            continue
+        live = g[g["OI"].fillna(0) > 0]
+        ce = g[g["OPT"] == "CE"]["OI"].sum()
+        pe = g[g["OPT"] == "PE"]["OI"].sum()
+        spot = g["UNDERLYING"].dropna()
+
+        rows.append({
+            "Symbol": sym,
+            "Spot": float(spot.iloc[0]) if len(spot) else float("nan"),
+            "Total OI": oi,
+            "Volume": g["VOLUME"].sum() if "VOLUME" in g.columns else float("nan"),
+            "Live strikes": int(live["STRIKE"].nunique()),
+            "Expiries": int(g["EXPIRY"].nunique()) if "EXPIRY" in g.columns else 0,
+            "PCR": pe / ce if ce else float("nan"),
+        })
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+
+    # IV rank against each underlying's own collected history
+    if iv_hist is not None and not iv_hist.empty and "ATM_IV" in iv_hist.columns:
+        ranks, pcts, days = [], [], []
+        for sym in out["Symbol"]:
+            h = iv_hist[iv_hist["SYMBOL"] == sym]["ATM_IV"]
+            cur = h.iloc[-1] if len(h) else float("nan")
+            r, p, n = iv_rank(h, cur)
+            ranks.append(r); pcts.append(p); days.append(n)
+        out["ATM IV %"] = [iv_hist[iv_hist["SYMBOL"] == s]["ATM_IV"].iloc[-1]
+                           if len(iv_hist[iv_hist["SYMBOL"] == s]) else float("nan")
+                           for s in out["Symbol"]]
+        out["IV rank"] = ranks
+        out["IV percentile"] = pcts
+        out["IV days"] = days
+
+    # Event risk before the near expiry
+    if meetings is not None and not meetings.empty and "SYMBOL" in meetings.columns:
+        today = pd.Timestamp(datetime.now().date())
+        soon = meetings[(meetings["MEETING_DATE"] >= today)
+                        & (meetings["MEETING_DATE"] <= today + pd.Timedelta(days=35))]
+        upcoming = dict(zip(soon["SYMBOL"].astype(str).str.upper(),
+                            soon["MEETING_DATE"]))
+        out["Event before expiry"] = [
+            upcoming.get(str(s).upper(), pd.NaT) for s in out["Symbol"]]
+
+    # What the pricing argues for -- about premium, not about direction
+    def pricing_read(r):
+        rank = r.get("IV rank")
+        if rank is None or rank != rank:
+            return "No IV history yet"
+        if rank >= 70:
+            return "Options expensive vs own history"
+        if rank <= 30:
+            return "Options cheap vs own history"
+        return "IV mid-range"
+
+    if "IV rank" in out.columns:
+        out["Pricing"] = out.apply(pricing_read, axis=1)
+
+    return out.sort_values("Total OI", ascending=False)
+
+
+def strike_ladder(fno: pd.DataFrame, symbol: str, expiry, opt_type: str,
+                  spot: float, as_of, lot: int, n_strikes: int = 12) -> pd.DataFrame:
+    """
+    Strikes side by side for a view you have already formed.
+
+    Delta doubles as a rough chance of finishing in the money, which is the
+    honest way to compare a cheap far-OTM option against an expensive near one.
+    """
+    if fno.empty:
+        return pd.DataFrame()
+
+    g = fno[(fno["SYMBOL"] == symbol) & (fno["OPT"] == opt_type)].copy()
+    if "EXPIRY" in g.columns:
+        g = g[pd.to_datetime(g["EXPIRY"], errors="coerce") == pd.Timestamp(expiry)]
+    if g.empty:
+        return pd.DataFrame()
+
+    for c in ("STRIKE", "CLOSE", "OI", "VOLUME"):
+        if c in g.columns:
+            g[c] = pd.to_numeric(g[c], errors="coerce")
+
+    days = max((pd.Timestamp(expiry) - pd.Timestamp(as_of)).days, 0)
+    t = days / 365.0
+    is_call = opt_type == "CE"
+
+    g = g.iloc[(g["STRIKE"] - spot).abs().argsort()[:n_strikes]].sort_values("STRIKE")
+
+    rows = []
+    for _, r in g.iterrows():
+        k, prem = r["STRIKE"], r["CLOSE"]
+        iv = implied_vol(prem, spot, k, t, is_call=is_call)
+        gk = greeks(spot, k, t, (iv / 100.0) if iv == iv else float("nan"),
+                    is_call=is_call) if iv == iv else {}
+        be = (k + prem) if is_call else (k - prem)
+        rows.append({
+            "Strike": k,
+            "Moneyness": "ITM" if ((is_call and k < spot) or (not is_call and k > spot))
+                         else ("ATM" if abs(k - spot) / spot < 0.01 else "OTM"),
+            "Premium": prem,
+            "Cost / lot": prem * lot,
+            "IV %": iv,
+            "Delta": gk.get("delta", float("nan")),
+            "Theta / day / lot": gk.get("theta", float("nan")) * lot
+                                 if gk.get("theta") == gk.get("theta") else float("nan"),
+            "Breakeven": be,
+            "Move needed %": ((be - spot) / spot) * 100,
+            "OI": r.get("OI", float("nan")),
+        })
+    out = pd.DataFrame(rows)
+    out["Days to expiry"] = days
+    return out
+
+
 # ============================================================== GLOSSARY =====
 # Every term the app shows, in plain English. Definitions say what a number
 # measures AND what it does not tell you -- the second half is usually the
 # part that costs money.
 
 GLOSSARY = {
+    "Event before expiry": "A scheduled board meeting before the option expires — when implied volatility typically collapses.",
+    "Pricing": "Where implied volatility sits against this underlying's own history. A statement about premium, not direction.",
+    "Live strikes": "How many strikes actually carry open interest. Few live strikes means poor choice and wide spreads.",
+    "Moneyness": "Whether the strike is in, at, or out of the money relative to the current price.",
+    "Move needed %": "How far the underlying must travel for the option to break even. Compare it against the stock's typical daily move before deciding a cheap strike is good value.",
     "Quarters": "How many filed quarters the change is computed from. Two is a comparison, not a trend.",
     "Accumulation score": "A weighted sum of ownership changes: promoter and institutional increases add, rising pledges subtract. Not a verdict — it cannot tell why a stake moved.",
     "MF %": "Mutual fund ownership as a percentage of equity. Rising MF holding in a smallcap means professional money is building a position.",
@@ -3132,12 +3409,12 @@ st.markdown(f'<div class="pulse-strip">{"".join(cells)}</div>', unsafe_allow_htm
 
 # ================================================================= TABS ======
 
-(tab_market, tab_setups, tab_screen, tab_tech, tab_opt, tab_disc, tab_own,
- tab_journal, tab_hunt, tab_test, tab_news, tab_flows, tab_ratios, tab_book,
- tab_depth) = st.tabs(
-    ["Markets", "Weekly setups", "Screener (all NSE)", "Technicals", "Options",
-     "Disclosures", "Ownership", "Journal", "Small-cap hunt", "Backtest", "News",
-     "FII / DII", "Ratios", "Order Book", "Depth"]
+(tab_market, tab_sent, tab_setups, tab_screen, tab_tech, tab_opt, tab_disc,
+ tab_own, tab_journal, tab_hunt, tab_test, tab_news, tab_flows, tab_ratios,
+ tab_book, tab_depth) = st.tabs(
+    ["Markets", "Sentiment", "Weekly setups", "Screener (all NSE)", "Technicals",
+     "Options", "Disclosures", "Ownership", "Journal", "Small-cap hunt",
+     "Backtest", "News", "FII / DII", "Ratios", "Order Book", "Depth"]
 )
 
 with tab_market, safe_tab("Markets"):
@@ -3170,6 +3447,75 @@ with tab_market, safe_tab("Markets"):
                      column_config=help_config(global_df.drop(columns=["Symbol"])),
                 use_container_width=True, height=520, hide_index=True,
             )
+
+
+with tab_sent, safe_tab("Sentiment"):
+    st.markdown("#### Market sentiment")
+    st.markdown(
+        "Eight things that were **measured** today, each scaled the same way "
+        "so they can be compared. The composite is an average of what could be "
+        "computed — the individual rows matter more, because where they "
+        "disagree is usually the informative part."
+    )
+    glossary_panel("What do these sentiment components mean?")
+
+    sent_screen, _, _ = load_market_screen()
+    sent_scan = cached_pattern_scan() if (HISTORY_DIR.exists()
+                                          and any(HISTORY_DIR.glob("*.csv.gz"))) \
+        else pd.DataFrame()
+    sent_fno = load_fno_latest()
+
+    vix_level, vix_hist = float("nan"), None
+    if not global_df.empty:
+        vrow = global_df[global_df["Market"] == "India VIX"]
+        if not vrow.empty:
+            vix_level = float(vrow.iloc[0]["Last"])
+    try:
+        vraw = yf.download("^INDIAVIX", period="1y", interval="1d",
+                           progress=False, auto_adjust=False)
+        if vraw is not None and not vraw.empty:
+            vix_hist = vraw["Close"].dropna()
+    except Exception:
+        vix_hist = None
+
+    comps = sentiment_components(sent_screen, sent_scan, flows_df,
+                                 vix_level, vix_hist, sent_fno)
+
+    if not comps:
+        st.info("Not enough data yet. The Screener and stored history feed this tab.")
+    else:
+        summ = sentiment_summary(comps)
+        colour = {"up": "#2fbf71", "down": "#e5484d", "flat": "#6b7684"}[summ["tone"]]
+        st.markdown(
+            f'<div style="border-left:3px solid {colour};padding:0.9rem 1.1rem;'
+            f'background:#141a21;margin:0.5rem 0;">'
+            f'<div style="font-size:1.4rem;font-weight:650;color:{colour};">'
+            f'{summ["label"]}  <span style="font-family:ui-monospace;">'
+            f'{summ["score"]:+.0f}</span></div>'
+            f'<div style="color:#8b95a1;font-size:0.85rem;">'
+            f'Average of {summ["n"]} measured components · {summ["agreement"]}'
+            f'</div></div>', unsafe_allow_html=True)
+
+        table = pd.DataFrame([{"Component": n, "Score": s, "Reading": d}
+                              for n, s, d, _ in comps])
+        st.dataframe(colour_frame(table, ["Score"]),
+                     use_container_width=True, hide_index=True)
+
+        for name, score, _, note in comps:
+            st.markdown(f'<div class="item"><div class="item-meta">{name}'
+                        f'{" · not scored" if score != score else ""}</div>'
+                        f'<span style="color:#8b95a1;font-size:0.85rem;">{note}'
+                        f'</span></div>', unsafe_allow_html=True)
+
+        st.markdown(
+            '<div class="stale"><b>What this is not.</b> It describes today, it '
+            'does not forecast tomorrow — breadth and flows are famously poor at '
+            'timing, and volatility spikes mark lows about as often as tops. The '
+            'put-call ratio is deliberately shown but left out of the average: '
+            'high PCR reads as bearish to some and contrarian-bullish to others, '
+            'and folding a contested sign into a composite would quietly impose '
+            'one reading on every other component.</div>',
+            unsafe_allow_html=True)
 
 
 with tab_setups, safe_tab("Weekly setups"):
@@ -3818,7 +4164,8 @@ with tab_opt, safe_tab("Options"):
 
     opt_view = st.radio(
         "View",
-        ["Scenario calculator", "Payoff calculator", "Option chain", "IV rank"],
+        ["Scenario calculator", "Which stocks", "Strike ladder",
+         "Payoff calculator", "Option chain", "IV rank"],
         horizontal=True, key="opt_view")
 
     # -------------------------------------------------- scenario calculator ---
@@ -3977,6 +4324,94 @@ with tab_opt, safe_tab("Options"):
                     'wrong in the direction that hurts buyers: IV typically rises '
                     'when price falls and collapses after events. Use the IV change '
                     'box to test that rather than assuming it away.</div>',
+                    unsafe_allow_html=True)
+
+    # ------------------------------------------------ which stocks / ladder ---
+    elif opt_view == "Which stocks":
+        st.caption(
+            "Which underlyings are *suitable* for options — liquid enough to "
+            "get filled, with enough strikes to choose from. Suitability is "
+            "measurable; what to trade is not."
+        )
+        cand_fno = load_fno_latest()
+        if cand_fno.empty:
+            st.info("No F&O data stored yet. Run the collector.")
+        else:
+            cands = option_candidates(cand_fno, load_iv_history(), load_meetings())
+            if cands.empty:
+                st.info("Nothing passed the liquidity floor.")
+            else:
+                st.caption(f"{len(cands)} underlyings with meaningful open interest.")
+                if "IV rank" in cands.columns and cands["IV rank"].notna().any():
+                    f1, f2 = st.columns(2)
+                    only_cheap = f1.checkbox("Only IV rank below 30", key="oc_cheap")
+                    only_rich = f2.checkbox("Only IV rank above 70", key="oc_rich")
+                    if only_cheap:
+                        cands = cands[cands["IV rank"].fillna(50) < 30]
+                    if only_rich:
+                        cands = cands[cands["IV rank"].fillna(50) > 70]
+
+                st.dataframe(cands.style.format(precision=2, na_rep="—"),
+                             column_config=help_config(cands),
+                             use_container_width=True, height=460, hide_index=True)
+
+                st.markdown(
+                    '<div class="stale">The <b>Pricing</b> column is a statement '
+                    'about premium, not direction. "Expensive vs own history" '
+                    'argues for structures that sell premium rather than buy it — '
+                    'but expensive options often stay expensive because something '
+                    'is genuinely uncertain, and selling into that is how people '
+                    'discover what a tail risk feels like. <b>Event before '
+                    'expiry</b> is the column to check before buying premium.</div>',
+                    unsafe_allow_html=True)
+
+    elif opt_view == "Strike ladder":
+        st.caption(
+            "Compare strikes for a view you have already formed. Delta doubles "
+            "as a rough chance of finishing in the money, which is the honest "
+            "way to weigh a cheap far-OTM option against a costly near one."
+        )
+        lad_fno = load_fno_latest()
+        if lad_fno.empty:
+            st.info("No F&O data stored yet. Run the collector.")
+        else:
+            opts_only = lad_fno[lad_fno["OPT"].isin(["CE", "PE"])]
+            l1, l2, l3 = st.columns(3)
+            lad_sym = l1.selectbox("Underlying",
+                                   sorted(opts_only["SYMBOL"].dropna().unique()),
+                                   key="lad_sym")
+            sub = opts_only[opts_only["SYMBOL"] == lad_sym]
+            exps = sorted(pd.to_datetime(sub["EXPIRY"], errors="coerce").dropna().unique())
+            labels = [pd.Timestamp(e).strftime("%d-%b-%Y") for e in exps]
+            lad_exp = l2.selectbox("Expiry", labels, key="lad_exp")
+            lad_type = l3.selectbox("Type", ["CE", "PE"], key="lad_type",
+                                    help="CE for a rising view, PE for a falling one.")
+
+            spot_s = pd.to_numeric(sub["UNDERLYING"], errors="coerce").dropna()
+            spot_v = float(spot_s.iloc[0]) if len(spot_s) else float("nan")
+            lot_v = load_lot_sizes().get(lad_sym, 1)
+            snap = lad_fno["DATE"].iloc[0]
+
+            ladder = strike_ladder(opts_only, lad_sym, exps[labels.index(lad_exp)],
+                                   lad_type, spot_v, snap, lot_v)
+            if ladder.empty:
+                st.info("No strikes found for that combination.")
+            else:
+                st.caption(f"Spot {spot_v:,.2f} · lot {lot_v} · "
+                           f"{int(ladder['Days to expiry'].iloc[0])} days to expiry "
+                           f"· snapshot {snap}")
+                st.dataframe(
+                    ladder.drop(columns=["Days to expiry"]).style.format(
+                        precision=2, na_rep="—"),
+                    column_config=help_config(ladder),
+                    use_container_width=True, height=440, hide_index=True)
+                st.markdown(
+                    '<div class="stale"><b>Move needed %</b> is the column that '
+                    'settles most arguments. A far-OTM option looks cheap until '
+                    'you see that it needs an 8% move in three weeks to break '
+                    'even — against a stock that typically moves 1.2% a day. '
+                    'Compare it with the ATR on the Technicals tab before '
+                    'deciding the cheap one is better value.</div>',
                     unsafe_allow_html=True)
 
     # ------------------------------------------------------------ payoff ---
