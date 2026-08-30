@@ -30,7 +30,7 @@ st.set_page_config(
 )
 
 DATA_DIR = Path(__file__).parent / "data"
-APP_VERSION = "v17 — sentiment"
+APP_VERSION = "v18"
 
 
 # ============================================================ DEFAULT DATA ===
@@ -2796,7 +2796,23 @@ def ownership_trends(shp: pd.DataFrame, quarters: int = 4) -> pd.DataFrame:
 # usually the informative part.
 
 def _scale(value, low, high):
-    """Map a value onto -100..+100 across a stated range."""
+    """
+    Map a value onto -100..+100 across a stated range.
+
+    Coerces to a scalar first: pandas operations upstream can hand back a
+    one-element Series, and comparing that to itself raises rather than
+    returning a boolean.
+    """
+    try:
+        if hasattr(value, "item") and getattr(value, "size", 1) == 1:
+            value = value.item()
+        elif isinstance(value, (pd.Series, pd.DataFrame)):
+            value = float(pd.Series(value).dropna().iloc[0])
+        elif value is not None:
+            value = float(value)
+    except (TypeError, ValueError, IndexError, AttributeError):
+        return float("nan")
+
     if value is None or value != value or high == low:
         return float("nan")
     pos = (value - low) / (high - low)
@@ -2848,7 +2864,8 @@ def sentiment_components(screen, scan, flows_df, vix_level, vix_hist=None,
     # 4. Volatility. Inverted: high VIX is fear, so it scores negative.
     if vix_level == vix_level and vix_level:
         if vix_hist is not None and len(vix_hist) > 60:
-            pctile = (vix_hist < vix_level).mean() * 100
+            vh = pd.Series(vix_hist).astype(float).dropna()
+            pctile = float((vh < float(vix_level)).mean() * 100)
             score = -_scale(pctile, 20, 80)
             detail = f"VIX {vix_level:.2f} — {pctile:.0f}th percentile of its own year"
         else:
@@ -3474,7 +3491,13 @@ with tab_sent, safe_tab("Sentiment"):
         vraw = yf.download("^INDIAVIX", period="1y", interval="1d",
                            progress=False, auto_adjust=False)
         if vraw is not None and not vraw.empty:
-            vix_hist = vraw["Close"].dropna()
+            # yfinance returns MultiIndex columns for a single ticker, so
+            # vraw["Close"] is a DataFrame, not a Series. Squeeze it, or every
+            # downstream comparison produces a Series instead of a number.
+            vh = vraw["Close"]
+            if isinstance(vh, pd.DataFrame):
+                vh = vh.iloc[:, 0]
+            vix_hist = pd.Series(vh).dropna()
     except Exception:
         vix_hist = None
 
