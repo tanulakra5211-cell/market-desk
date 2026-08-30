@@ -31,7 +31,7 @@ st.set_page_config(
 )
 
 DATA_DIR = Path(__file__).parent / "data"
-APP_VERSION = "v19 — momentum + news"
+APP_VERSION = "v20"
 
 
 # ============================================================ DEFAULT DATA ===
@@ -3206,12 +3206,166 @@ def momentum_news_screen(screen: pd.DataFrame, tagged: pd.DataFrame,
     return out
 
 
+# ====================================================== HISTORICAL OUTCOMES ==
+# The honest version of a price target. Rather than predicting a number, this
+# finds every past date on which this stock was in a comparable state and
+# reports what the following N days actually did.
+#
+# The unconditional distribution is always shown alongside. If the conditional
+# result matches it, the condition told you nothing -- and that is the most
+# common outcome, which is exactly why it must be visible.
+
+def _state_series(closes: pd.Series):
+    """RSI bucket and trend position for every day in the series."""
+    delta = closes.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rsi = 100 - (100 / (1 + gain / loss.replace(0, float("nan"))))
+
+    sma50 = closes.rolling(50).mean()
+    sma200 = closes.rolling(200).mean()
+
+    rsi_bucket = pd.cut(rsi, [0, 30, 45, 55, 70, 100],
+                        labels=["<30", "30-45", "45-55", "55-70", ">70"])
+    above50 = closes > sma50
+    above200 = closes > sma200
+    return rsi, rsi_bucket, above50, above200
+
+
+def historical_outcomes(hist: pd.DataFrame, symbol: str, horizon: int = 10,
+                        min_sample: int = 40) -> dict:
+    """
+    What the next `horizon` days did, historically, from today's state.
+
+    Returns both the conditional and unconditional distributions plus the
+    sample size, because a conditional median computed from six observations
+    is not information.
+    """
+    g = hist[hist["SYMBOL"] == symbol].sort_values("DATE")
+    closes = pd.Series(g["CLOSE"].values, index=pd.to_datetime(g["DATE"].values))
+    closes = closes.dropna()
+    n = len(closes)
+    if n < 80 + horizon:
+        return {"error": f"only {n} trading days stored — needs at least "
+                         f"{80 + horizon} for a {horizon}-day study"}
+
+    fwd = (closes.shift(-horizon) / closes - 1) * 100
+    rsi, bucket, above50, above200 = _state_series(closes)
+
+    valid = fwd.notna() & bucket.notna() & above50.notna()
+    uncond = fwd[valid]
+
+    cur_bucket = bucket.iloc[-1]
+    cur_a50 = bool(above50.iloc[-1]) if pd.notna(above50.iloc[-1]) else None
+    cur_a200 = bool(above200.iloc[-1]) if pd.notna(above200.iloc[-1]) else None
+
+    mask = valid & (bucket == cur_bucket) & (above50 == cur_a50)
+    if cur_a200 is not None and above200.notna().any():
+        tighter = mask & (above200 == cur_a200)
+        if tighter.sum() >= min_sample:
+            mask = tighter
+
+    cond = fwd[mask]
+
+    def describe(s):
+        s = s.dropna()
+        if s.empty:
+            return {}
+        return {
+            "n": int(len(s)),
+            "median": float(s.median()),
+            "mean": float(s.mean()),
+            "hit": float((s > 0).mean() * 100),
+            "p10": float(s.quantile(0.10)),
+            "p90": float(s.quantile(0.90)),
+            "worst": float(s.min()),
+            "best": float(s.max()),
+        }
+
+    spot = float(closes.iloc[-1])
+    out = {
+        "symbol": symbol, "spot": spot, "horizon": horizon,
+        "state": (f"RSI {cur_bucket}"
+                  + (", above 50DMA" if cur_a50 else ", below 50DMA")
+                  + ("" if cur_a200 is None
+                     else (", above 200DMA" if cur_a200 else ", below 200DMA"))),
+        "conditional": describe(cond),
+        "unconditional": describe(uncond),
+        "days_stored": n,
+    }
+
+    c, u = out["conditional"], out["unconditional"]
+    if c and u:
+        out["edge"] = c["median"] - u["median"]
+        out["hit_edge"] = c["hit"] - u["hit"]
+
+        # Overlapping windows are the trap here. Consecutive days share
+        # horizon-1 of their forward days, so 22 observations of a 10-day
+        # return are nowhere near 22 independent samples -- they are closer to
+        # two. Tested on a pure random walk, the naive version reported a
+        # +1.9% "edge" at 64% hit rate and called it informative. Dividing by
+        # the horizon gives the effective sample size, and the difference must
+        # then clear two standard errors computed on THAT number.
+        eff_n = max(c["n"] / horizon, 1.0)
+        out["effective_n"] = eff_n
+
+        spread = cond.dropna().std()
+        se = (spread / (eff_n ** 0.5)) if eff_n > 0 and spread == spread else float("inf")
+        out["std_error"] = se
+        out["threshold"] = 2 * se
+
+        out["informative"] = bool(
+            eff_n >= 5                      # at least ~5 independent windows
+            and se == se and se != float("inf")
+            and abs(out["edge"]) > 2 * se   # beyond what noise would produce
+        )
+        out["verdict"] = (
+            "Different from the base rate beyond what noise explains"
+            if out["informative"] else
+            (f"Not distinguishable from the base rate — only {eff_n:.1f} "
+             f"independent windows" if eff_n < 5 else
+             "Not distinguishable from the base rate")
+        )
+        if c:
+            out["band_low"] = spot * (1 + c["p10"] / 100)
+            out["band_high"] = spot * (1 + c["p90"] / 100)
+            out["band_mid"] = spot * (1 + c["median"] / 100)
+    return out
+
+
+def outcomes_across_market(hist: pd.DataFrame, symbols: list, horizon: int = 10,
+                           min_sample: int = 40) -> pd.DataFrame:
+    """Run the same study across many stocks and rank by conditional median."""
+    rows = []
+    for sym in symbols:
+        r = historical_outcomes(hist, sym, horizon, min_sample)
+        c, u = r.get("conditional"), r.get("unconditional")
+        if not c or not u or c["n"] < min_sample:
+            continue
+        rows.append({
+            "Symbol": sym, "Spot": r["spot"], "State": r["state"],
+            "Sample": c["n"], "Independent windows": round(r.get("effective_n", 0), 1),
+            "Beyond noise": r.get("informative", False),
+            "Median %": c["median"], "Hit rate %": c["hit"],
+            "Base median %": u["median"], "Base hit %": u["hit"],
+            "Edge %": r.get("edge", float("nan")),
+            "P10 %": c["p10"], "P90 %": c["p90"],
+            "Low": r.get("band_low", float("nan")),
+            "High": r.get("band_high", float("nan")),
+        })
+    out = pd.DataFrame(rows)
+    return out.sort_values("Edge %", ascending=False) if not out.empty else out
+
+
 # ============================================================== GLOSSARY =====
 # Every term the app shows, in plain English. Definitions say what a number
 # measures AND what it does not tell you -- the second half is usually the
 # part that costs money.
 
 GLOSSARY = {
+    "Base median %": "This stock's typical move over the same horizon regardless of state. If the conditional result matches it, the condition told you nothing.",
+    "Beyond noise": "Whether the difference from the base rate exceeds two standard errors on the effective sample. Usually false, which is the honest result.",
+    "Independent windows": "Matching days divided by the horizon. Overlapping windows share most of their days, so 100 matches over a 10-day horizon is really about 10 independent observations. This is the number that governs reliability.",
     "Latest headline": "Most recent archived item mentioning this company.",
     "Filings": "Exchange announcements in the window. A filing is a fact the company reported, unlike a headline about it.",
     "Read": "Whether the move and the news agree. 'Move without news' is the interesting case — either something unpublished is known, or the move is noise.",
@@ -4204,6 +4358,99 @@ with tab_tech, safe_tab("Technicals"):
                 'only way to know whether a setup has paid on your names.</div>',
                 unsafe_allow_html=True,
             )
+
+
+    st.divider()
+    st.markdown("#### What happened last time it looked like this")
+    st.caption(
+        "Not a forecast. Every past date on which this stock was in a "
+        "comparable state, and what the following days actually did — from "
+        "your own stored history."
+    )
+
+    ho_hist = cached_history()
+    if ho_hist.empty:
+        st.info("Needs stored history. Run the collector — see the Backtest tab.")
+    else:
+        h1, h2 = st.columns([2, 1])
+        ho_syms = sorted(ho_hist["SYMBOL"].unique())
+        default_ix = 0
+        for i, s in enumerate(ho_syms):
+            if f"{s}.NS" in tickers:
+                default_ix = i
+                break
+        ho_sym = h1.selectbox("Stock", ho_syms, index=default_ix, key="ho_sym")
+        ho_days = h2.select_slider("Horizon (trading days)",
+                                   options=[5, 10, 20, 30], value=10, key="ho_days")
+
+        res = historical_outcomes(ho_hist, ho_sym, ho_days)
+
+        if "error" in res:
+            st.warning(res["error"])
+        else:
+            c, u = res["conditional"], res["unconditional"]
+            st.markdown(f"**{ho_sym}** at Rs {res['spot']:,.2f} · current state: "
+                        f"*{res['state']}* · {res['days_stored']} days stored")
+
+            if not c:
+                st.info("No comparable past state found in the stored history.")
+            else:
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric(f"Median {ho_days}d move", f"{c['median']:+.1f}%",
+                          delta=f"{res['edge']:+.1f}% vs base",
+                          help="Base is this stock's typical move over the same "
+                               "horizon regardless of state.")
+                m2.metric("Finished higher", f"{c['hit']:.0f}%",
+                          delta=f"{res['hit_edge']:+.0f}pp vs base")
+                m3.metric("Matching days", f"{c['n']}")
+                m4.metric("Independent windows", f"{res['effective_n']:.1f}",
+                          help="Overlapping windows share most of their days, "
+                               "so this is the number that governs reliability.")
+
+                verdict_ok = res.get("informative")
+                colour = "#2fbf71" if verdict_ok else "#c9a227"
+                st.markdown(
+                    f'<div style="border-left:3px solid {colour};padding:0.7rem 1rem;'
+                    f'background:#141a21;margin:0.5rem 0;color:#e6eaef;">'
+                    f'<b>{res["verdict"]}.</b><br>'
+                    f'<span style="color:#8b95a1;font-size:0.85rem;">'
+                    f'The gap between this state and the base rate is '
+                    f'{res["edge"]:+.2f}%, against a noise threshold of '
+                    f'±{res["threshold"]:.2f}%.</span></div>',
+                    unsafe_allow_html=True)
+
+                st.markdown(f"**Where it landed, {ho_days} days later**")
+                band = pd.DataFrame([{
+                    "Outcome": "Worst seen", "Move %": c["worst"],
+                    "Price": res["spot"] * (1 + c["worst"] / 100)},
+                    {"Outcome": "10th percentile", "Move %": c["p10"],
+                     "Price": res["band_low"]},
+                    {"Outcome": "Median", "Move %": c["median"],
+                     "Price": res["band_mid"]},
+                    {"Outcome": "90th percentile", "Move %": c["p90"],
+                     "Price": res["band_high"]},
+                    {"Outcome": "Best seen", "Move %": c["best"],
+                     "Price": res["spot"] * (1 + c["best"] / 100)}])
+                st.dataframe(colour_frame(band, ["Move %"]),
+                             use_container_width=True, hide_index=True)
+
+                st.caption(
+                    f"Base rate for comparison: median {u['median']:+.1f}%, "
+                    f"finished higher {u['hit']:.0f}% of the time, over "
+                    f"{u['n']} overlapping windows."
+                )
+
+                st.markdown(
+                    '<div class="stale"><b>Why there is no single target here.</b> '
+                    'A 10-day price target implies a precision that does not exist '
+                    '— the spread between the 10th and 90th percentile above is '
+                    'the honest answer, and it is usually wide. Two further '
+                    'cautions. These windows overlap heavily, so the effective '
+                    'sample is the matching days divided by the horizon, which is '
+                    'why a hundred matches can still mean ten real observations. '
+                    'And this is one stock\'s own past in one market regime — the '
+                    'regime changing is not something the history can warn you '
+                    'about.</div>', unsafe_allow_html=True)
 
     st.divider()
     st.markdown("#### Single stock chart read")
