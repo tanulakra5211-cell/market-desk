@@ -219,6 +219,123 @@ def collect_flows(client: httpx.Client) -> bool:
 
 
 
+
+NEWS_DIR = Path(__file__).parent / "data" / "news"
+
+NEWS_FEEDS = {
+    "Moneycontrol": "https://www.moneycontrol.com/rss/marketreports.xml",
+    "MC Business": "https://www.moneycontrol.com/rss/business.xml",
+    "Economic Times": "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
+    "ET Stocks": "https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms",
+    "Business Standard": "https://www.business-standard.com/rss/markets-106.rss",
+    "Mint Markets": "https://www.livemint.com/rss/markets",
+    "Hindu BusinessLine": "https://www.thehindubusinessline.com/markets/feeder/default.rss",
+}
+
+BSE_ANN_URL = "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
+
+
+def collect_news(client: httpx.Client, days_back: int = 3) -> int:
+    """
+    Archive headlines and exchange filings.
+
+    RSS only exposes a front page — two days at most. Everything older is gone
+    unless captured, and without an archive you cannot ask whether a move had
+    news behind it, which is the question worth asking.
+
+    Only headline, link and a short summary are stored. Article text is not.
+    """
+    NEWS_DIR.mkdir(parents=True, exist_ok=True)
+    rows = []
+
+    # 1. Publisher RSS
+    try:
+        import feedparser
+    except ImportError:
+        print("    feedparser not installed — skipping RSS")
+        feedparser = None
+
+    if feedparser is not None:
+        for source, url in NEWS_FEEDS.items():
+            try:
+                parsed = feedparser.parse(url)
+                for e in parsed.entries[:40]:
+                    pub = None
+                    for attr in ("published_parsed", "updated_parsed"):
+                        if getattr(e, attr, None):
+                            pub = datetime(*getattr(e, attr)[:6])
+                            break
+                    link = e.get("link", "")
+                    if not link:
+                        continue
+                    rows.append({
+                        "PUBLISHED": pub.strftime("%Y-%m-%d %H:%M") if pub else "",
+                        "SOURCE": source, "KIND": "news",
+                        "HEADLINE": re.sub("<[^>]+>", "", e.get("title", ""))[:300],
+                        "SYMBOL": "",
+                        "CATEGORY": "",
+                        "LINK": link,
+                        "SUMMARY": re.sub("<[^>]+>", "", e.get("summary", ""))[:300],
+                    })
+                print(f"    {source}: {len(parsed.entries[:40])} items")
+            except Exception as exc:  # noqa: BLE001
+                print(f"    {source}: {type(exc).__name__}")
+            time.sleep(0.3)
+
+    # 2. BSE corporate filings -- these carry a scrip code, so they map to a
+    # company with certainty rather than by guessing from a headline.
+    today = datetime.now()
+    params = {
+        "pageno": 1, "strCat": "-1",
+        "strPrevDate": (today - timedelta(days=days_back)).strftime("%Y%m%d"),
+        "strScrip": "", "strSearch": "P",
+        "strToDate": today.strftime("%Y%m%d"),
+        "strType": "C", "subcategory": "-1",
+    }
+    try:
+        resp = httpx.get(BSE_ANN_URL, params=params, timeout=25.0, headers={
+            "User-Agent": HEADERS["User-Agent"],
+            "Referer": "https://www.bseindia.com/",
+            "Origin": "https://www.bseindia.com",
+            "Accept": "application/json, text/plain, */*"})
+        table = resp.json().get("Table", []) or [] if resp.status_code == 200 else []
+        for item in table:
+            att = item.get("ATTACHMENTNAME") or ""
+            rows.append({
+                "PUBLISHED": str(item.get("News_submission_dt")
+                                 or item.get("DT_TM") or "")[:16],
+                "SOURCE": "BSE filing", "KIND": "filing",
+                "HEADLINE": str(item.get("NEWSSUB", ""))[:300],
+                "SYMBOL": "",
+                "CATEGORY": str(item.get("CATEGORYNAME", ""))[:60],
+                "LINK": (f"https://www.bseindia.com/xml-data/corpfiling/"
+                         f"AttachLive/{att}" if att else ""),
+                "SUMMARY": str(item.get("SLONGNAME", ""))[:120],
+            })
+        print(f"    BSE filings: {len(table)} items")
+    except Exception as exc:  # noqa: BLE001
+        print(f"    BSE filings: {type(exc).__name__}: {str(exc)[:60]}")
+
+    if not rows:
+        return 0
+
+    df = pd.DataFrame(rows)
+    month = today.strftime("%Y-%m")
+    path = NEWS_DIR / f"{month}.csv.gz"
+    if path.exists():
+        prev = pd.read_csv(path, skipinitialspace=True, dtype=str)
+        before = len(prev)
+        combined = pd.concat([prev, df.astype(str)], ignore_index=True)
+        combined = combined.drop_duplicates(subset=["LINK", "HEADLINE"])
+        added = len(combined) - before
+    else:
+        combined = df.astype(str).drop_duplicates(subset=["LINK", "HEADLINE"])
+        added = len(combined)
+    combined.to_csv(path, index=False, compression="gzip")
+    print(f"    {len(df)} fetched, {added} new — archive holds {len(combined):,}")
+    return added
+
+
 SHP_PATH = Path(__file__).parent / "data" / "shareholding.csv"
 MF_PATH = Path(__file__).parent / "data" / "mf_holdings.csv"
 
@@ -877,6 +994,9 @@ def main() -> int:
         collect_deals(client)
         collect_insider(client)
 
+        print("\nArchiving news and filings…")
+        collect_news(client)
+
         print("\nCollecting shareholding patterns…")
         collect_shareholding(client)
         collect_mf_disclosure_links(client)
@@ -959,6 +1079,9 @@ def main() -> int:
     print("\nCollecting deals and disclosures…")
     collect_deals(client)
     collect_insider(client)
+
+    print("\nArchiving news and filings…")
+    collect_news(client)
 
     print("\nCollecting shareholding patterns…")
     collect_shareholding(client)
