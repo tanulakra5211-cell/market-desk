@@ -9,6 +9,7 @@ Run locally:  streamlit run app.py
 """
 
 import io
+import re
 import time
 import traceback
 import zipfile
@@ -30,7 +31,7 @@ st.set_page_config(
 )
 
 DATA_DIR = Path(__file__).parent / "data"
-APP_VERSION = "v18"
+APP_VERSION = "v19 — momentum + news"
 
 
 # ============================================================ DEFAULT DATA ===
@@ -3078,12 +3079,142 @@ def strike_ladder(fno: pd.DataFrame, symbol: str, expiry, opt_type: str,
     return out
 
 
+# ================================================== MOMENTUM MEETS NEWS ======
+# Momentum alone tells you a stock moved. News alone tells you something was
+# said. The combination is the useful part: a move with a filing behind it and
+# a move with nothing behind it are different situations, and the second is
+# usually the one worth a closer look.
+
+NEWS_DIR = DATA_DIR / "news"
+
+# Words too generic to identify a company from a headline. "India Cements" is
+# a company; "India" in a headline is not.
+NAME_STOPWORDS = {
+    "LIMITED", "LTD", "INDIA", "INDIAN", "THE", "AND", "OF", "CO", "COMPANY",
+    "CORPORATION", "CORP", "INDUSTRIES", "ENTERPRISES", "GROUP", "HOLDINGS",
+    "INTERNATIONAL", "NATIONAL", "TECHNOLOGIES", "SERVICES", "SYSTEMS",
+    "PROJECTS", "FINANCE", "FINANCIAL", "BANK", "MOTORS", "STEEL", "POWER",
+    "ENERGY", "PHARMA", "LABORATORIES", "CEMENT", "CEMENTS", "CHEMICALS",
+}
+
+
+@st.cache_data(ttl=1800)
+def load_news_archive() -> pd.DataFrame:
+    """Everything the collector has archived."""
+    if not NEWS_DIR.exists():
+        return pd.DataFrame()
+    frames = []
+    for f in sorted(NEWS_DIR.glob("*.csv.gz")):
+        try:
+            frames.append(pd.read_csv(f, skipinitialspace=True, dtype=str))
+        except Exception:
+            continue
+    if not frames:
+        return pd.DataFrame()
+    df = pd.concat(frames, ignore_index=True)
+    df["PUBLISHED_DT"] = pd.to_datetime(df["PUBLISHED"], errors="coerce")
+    return df.drop_duplicates(subset=["LINK", "HEADLINE"]).sort_values(
+        "PUBLISHED_DT", ascending=False, na_position="last")
+
+
+def company_tokens(name: str, symbol: str) -> list:
+    """
+    Distinctive words that identify a company in a headline.
+
+    Generic words are stripped, because matching 'India' or 'Bank' would tag
+    half the market to every headline. A company with no distinctive word left
+    is matched on its ticker only — better to miss than to mislabel.
+    """
+    words = re.findall(r"[A-Za-z]{3,}", str(name).upper())
+    distinct = [w for w in words if w not in NAME_STOPWORDS]
+    tokens = distinct[:2] if distinct else []
+    sym = str(symbol).upper()
+    if len(sym) >= 4:
+        tokens.append(sym)
+    return list(dict.fromkeys(tokens))
+
+
+@st.cache_data(ttl=1800)
+def tag_news_with_symbols(_news: pd.DataFrame, universe: pd.DataFrame) -> pd.DataFrame:
+    """
+    Attach a symbol to each headline where one can be identified confidently.
+
+    Case-sensitive on the company's own capitalisation: a lowercase word in
+    running text is not a company name, and matching case-insensitively tags
+    every 'power' or 'bank' to a listed company.
+    """
+    if _news.empty or universe.empty:
+        return pd.DataFrame()
+
+    hay = (_news["HEADLINE"].fillna("") + " " + _news["SUMMARY"].fillna(""))
+    rows = []
+    for _, u in universe.iterrows():
+        sym = str(u["Symbol"])
+        toks = company_tokens(u.get("Company", sym), sym)
+        if not toks:
+            continue
+        pattern = "|".join(r"\b" + re.escape(t.title()) + r"\b|"
+                           r"\b" + re.escape(t.upper()) + r"\b" for t in toks)
+        hits = hay.str.contains(pattern, regex=True, case=True, na=False)
+        if hits.any():
+            sub = _news[hits].copy()
+            sub["SYMBOL_MATCH"] = sym
+            rows.append(sub)
+
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+
+def momentum_news_screen(screen: pd.DataFrame, tagged: pd.DataFrame,
+                         days: int = 7) -> pd.DataFrame:
+    """
+    Momentum and news coverage side by side, with the relationship classified.
+
+    The classification is the point. 'Move without news' is not a signal, but
+    it is a question — either something is known that has not been published,
+    or nothing is happening and the move is noise.
+    """
+    if screen.empty:
+        return pd.DataFrame()
+
+    out = screen.copy()
+    cutoff = pd.Timestamp.now() - pd.Timedelta(days=days)
+
+    if tagged is not None and not tagged.empty:
+        recent = tagged[tagged["PUBLISHED_DT"] >= cutoff]
+        counts = recent.groupby("SYMBOL_MATCH").size()
+        filings = recent[recent["KIND"] == "filing"].groupby("SYMBOL_MATCH").size()
+        latest = (recent.sort_values("PUBLISHED_DT", ascending=False)
+                  .groupby("SYMBOL_MATCH")["HEADLINE"].first())
+        out[f"News ({days}d)"] = out["Symbol"].map(counts).fillna(0).astype(int)
+        out["Filings"] = out["Symbol"].map(filings).fillna(0).astype(int)
+        out["Latest headline"] = out["Symbol"].map(latest).fillna("—")
+    else:
+        out[f"News ({days}d)"] = 0
+        out["Filings"] = 0
+        out["Latest headline"] = "—"
+
+    move_col = "1M %" if "1M %" in out.columns else "Day %"
+    move = out[move_col].fillna(0)
+    has_news = out[f"News ({days}d)"] > 0
+    big = move.abs() >= 5
+
+    out["Read"] = "Quiet"
+    out.loc[big & has_news, "Read"] = "Move with news"
+    out.loc[big & ~has_news, "Read"] = "Move without news"
+    out.loc[~big & has_news, "Read"] = "News without move"
+
+    return out
+
+
 # ============================================================== GLOSSARY =====
 # Every term the app shows, in plain English. Definitions say what a number
 # measures AND what it does not tell you -- the second half is usually the
 # part that costs money.
 
 GLOSSARY = {
+    "Latest headline": "Most recent archived item mentioning this company.",
+    "Filings": "Exchange announcements in the window. A filing is a fact the company reported, unlike a headline about it.",
+    "Read": "Whether the move and the news agree. 'Move without news' is the interesting case — either something unpublished is known, or the move is noise.",
     "Event before expiry": "A scheduled board meeting before the option expires — when implied volatility typically collapses.",
     "Pricing": "Where implied volatility sits against this underlying's own history. A statement about premium, not direction.",
     "Live strikes": "How many strikes actually carry open interest. Few live strikes means poor choice and wide spreads.",
@@ -3772,6 +3903,71 @@ with tab_screen, safe_tab("Screener"):
             file_name=f"nse_screen_{screen_date}.csv",
             mime="text/csv",
         )
+
+        st.divider()
+        st.markdown("#### Momentum against news")
+        st.caption(
+            "The same stocks, with whether anything was published about them. A "
+            "move with news behind it and a move with nothing behind it are "
+            "different situations."
+        )
+
+        archive = load_news_archive()
+        if archive.empty:
+            st.info(
+                "No news archived yet. The collector now stores headlines and BSE "
+                "filings each run — this fills in from the next one, and the "
+                "comparison gets more useful the longer it runs."
+            )
+        else:
+            n1, n2 = st.columns(2)
+            news_days = n1.select_slider("News window (days)", options=[3, 7, 14, 30],
+                                         value=7, key="mn_days")
+            read_filter = n2.multiselect(
+                "Show", ["Move with news", "Move without news",
+                         "News without move", "Quiet"],
+                default=["Move with news", "Move without news"], key="mn_read")
+
+            with st.spinner("Matching headlines to companies…"):
+                tagged = tag_news_with_symbols(archive, symbol_universe())
+
+            mn = momentum_news_screen(screen, tagged, news_days)
+            if read_filter:
+                mn = mn[mn["Read"].isin(read_filter)]
+
+            move_col = "1M %" if "1M %" in mn.columns else "Day %"
+            mn = mn.sort_values(move_col, ascending=False, na_position="last")
+
+            cols = [c for c in ["Symbol", "Company", "Close", "Day %", "1M %",
+                                "Turnover (Cr)", "Delivery %", f"News ({news_days}d)",
+                                "Filings", "Read", "Latest headline"]
+                    if c in mn.columns]
+            st.caption(f"{len(mn):,} stocks · archive holds {len(archive):,} items "
+                       f"from {archive['PUBLISHED_DT'].min():%d %b} onwards"
+                       if archive["PUBLISHED_DT"].notna().any() else f"{len(mn):,} stocks")
+            st.dataframe(colour_frame(mn[cols].head(300), ["Day %", "1M %"]),
+                         column_config=help_config(mn[cols]),
+                         use_container_width=True, height=460, hide_index=True)
+
+            st.download_button("Download this view",
+                               data=mn[cols].to_csv(index=False).encode("utf-8"),
+                               file_name="momentum_news.csv", mime="text/csv",
+                               key="mn_dl")
+
+            st.markdown(
+                '<div class="stale"><b>How to read the Read column.</b> '
+                '<i>Move with news</i> means the move has a published explanation — '
+                'often already priced by the time you see it. <i>Move without '
+                'news</i> is the more interesting case and the more dangerous one: '
+                'either something is known that has not been published, or nothing '
+                'is happening and it is noise. Pair it with the delivery percentage '
+                'before assuming the first. <i>News without move</i> means the '
+                'market read the news and shrugged, which is information about the '
+                'news.<br><br>Matching is by company name and ticker in the '
+                'headline, case-sensitively. It will miss articles that refer to a '
+                'company obliquely, and coverage is only as deep as the archive — '
+                'which starts the day your collector first runs.</div>',
+                unsafe_allow_html=True)
 
         st.divider()
         st.markdown("**Send a shortlist to the Ratios tab**")
