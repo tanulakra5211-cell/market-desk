@@ -31,7 +31,7 @@ st.set_page_config(
 )
 
 DATA_DIR = Path(__file__).parent / "data"
-APP_VERSION = "v20"
+APP_VERSION = "v21 — focus list"
 
 
 # ============================================================ DEFAULT DATA ===
@@ -3357,12 +3357,169 @@ def outcomes_across_market(hist: pd.DataFrame, symbols: list, horizon: int = 10,
     return out.sort_values("Edge %", ascending=False) if not out.empty else out
 
 
+# ============================================================ FOCUS LIST =====
+# A research queue, not a buy list. It finds stocks where evidence from
+# DIFFERENT families lines up, and shows the evidence so it can be checked.
+#
+# The families matter more than the count. Three technical signals are not
+# three pieces of evidence -- momentum, RSI and a breakout all read the same
+# price series. Promoter buying, rising delivery and a price breakout are
+# three, because they come from three different sources. Scoring by family
+# rather than by signal count is what stops this becoming a machine for
+# finding whatever the price already told you.
+
+EVIDENCE_FAMILIES = {
+    "price": "Price and chart",
+    "conviction": "Delivery and volume",
+    "ownership": "Who owns it",
+    "insider": "Insider and bulk deals",
+    "event": "News and filings",
+    "value": "Valuation",
+}
+
+
+def build_focus_list(screen, setups, scan, shp_trends, insider, deals,
+                     tagged_news, ratios, min_turnover=3.0, top_n=25):
+    """
+    Gather evidence per stock across families and rank by families in agreement.
+
+    Every row carries its reasons. A score with no visible reasons is a number
+    to be trusted blindly, which is the opposite of the point.
+    """
+    if screen is None or screen.empty:
+        return pd.DataFrame()
+
+    base = screen.copy()
+    if "Turnover (Cr)" in base.columns:
+        base = base[base["Turnover (Cr)"].fillna(0) >= min_turnover]
+    if base.empty:
+        return pd.DataFrame()
+
+    evidence = {sym: {} for sym in base["Symbol"]}
+
+    def add(sym, family, reason):
+        if sym in evidence:
+            evidence[sym].setdefault(family, []).append(reason)
+
+    # --- price and chart
+    if setups is not None and not setups.empty:
+        for _, r in setups[setups["Bias"] == "long"].iterrows():
+            add(r["Symbol"], "price",
+                f"{r['Setup']} · {r['R:R']:.1f}:1 reward-to-risk")
+    if scan is not None and not scan.empty:
+        for _, r in scan.iterrows():
+            if str(r.get("Stance", "")) == "Constructive":
+                add(r["Symbol"], "price",
+                    f"Chart stance constructive ({int(r.get('Score', 0)):+d})")
+    if "52W position %" in base.columns:
+        for _, r in base.iterrows():
+            pos = r.get("52W position %")
+            if pos == pos and pos >= 90:
+                add(r["Symbol"], "price", f"Near 52-week high ({pos:.0f}% of range)")
+
+    # --- conviction: delivery and volume
+    if scan is not None and not scan.empty and "Delivery trend" in scan.columns:
+        for _, r in scan.iterrows():
+            dt = r.get("Delivery trend")
+            if dt == dt and dt > 5:
+                add(r["Symbol"], "conviction",
+                    f"Delivery up {dt:.0f}pts on its 20-day average")
+            vx = r.get("Vol vs 20d")
+            if vx == vx and vx >= 2:
+                add(r["Symbol"], "conviction", f"Volume {vx:.1f}x the 20-day norm")
+
+    # --- ownership
+    if shp_trends is not None and not shp_trends.empty:
+        for _, r in shp_trends.iterrows():
+            sym = r["Symbol"]
+            if r.get("Quarters", 0) < 2:
+                continue
+            for col, label in [("PROMOTER change", "Promoter stake"),
+                               ("FII change", "FII holding"),
+                               ("MF change", "Mutual fund holding"),
+                               ("DII change", "DII holding")]:
+                v = r.get(col)
+                if v == v and v > 0.5:
+                    add(sym, "ownership", f"{label} up {v:.1f}pts over "
+                                          f"{int(r['Quarters'])} quarters")
+            pl = r.get("PLEDGED change")
+            if pl == pl and pl < -1:
+                add(sym, "ownership", f"Pledging down {abs(pl):.1f}pts")
+
+    # --- insider and bulk deals
+    if insider is not None and not insider.empty and "SYMBOL" in insider.columns:
+        recent = insider[insider["DATE"] >= pd.Timestamp.now() - pd.Timedelta(days=30)]
+        for _, r in recent.iterrows():
+            txn = str(r.get("TRANSACTION", "")).lower()
+            if "acqu" in txn or "buy" in txn:
+                add(str(r["SYMBOL"]).upper(), "insider",
+                    f"Insider acquisition by {str(r.get('PERSON',''))[:30]}")
+    if deals is not None and not deals.empty and "SYMBOL" in deals.columns:
+        recent = deals[deals["DATE"] >= pd.Timestamp.now() - pd.Timedelta(days=15)]
+        for _, r in recent.iterrows():
+            if str(r.get("SIDE", "")).upper().startswith("B"):
+                add(str(r["SYMBOL"]).upper(), "insider",
+                    f"Bulk buy: {str(r.get('CLIENT',''))[:32]}")
+
+    # --- events
+    if tagged_news is not None and not tagged_news.empty:
+        recent = tagged_news[tagged_news["PUBLISHED_DT"]
+                             >= pd.Timestamp.now() - pd.Timedelta(days=7)]
+        filings = recent[recent["KIND"] == "filing"]
+        for sym, g in filings.groupby("SYMBOL_MATCH"):
+            add(sym, "event", f"{len(g)} exchange filing(s) this week: "
+                              f"{str(g.iloc[0]['HEADLINE'])[:60]}")
+
+    # --- valuation, only where fundamentals have been fetched
+    if ratios is not None and not ratios.empty and "Ticker" in ratios.columns:
+        for _, r in ratios.iterrows():
+            sym = str(r["Ticker"]).replace(".NS", "")
+            roce, de = r.get("ROCE %"), r.get("D/E")
+            growth = r.get("Rev Growth %")
+            if roce == roce and roce > 20 and de == de and de < 60:
+                add(sym, "value", f"ROCE {roce:.0f}% with low debt")
+            if growth == growth and growth > 20:
+                add(sym, "value", f"Revenue growing {growth:.0f}%")
+
+    rows = []
+    for _, r in base.iterrows():
+        sym = r["Symbol"]
+        ev = evidence.get(sym, {})
+        if not ev:
+            continue
+        families = list(ev.keys())
+        reasons = []
+        for fam in families:
+            reasons.append(f"{EVIDENCE_FAMILIES[fam]}: " + "; ".join(ev[fam][:2]))
+        rows.append({
+            "Symbol": sym,
+            "Close": r.get("Close"),
+            "Day %": r.get("Day %"),
+            "1M %": r.get("1M %"),
+            "Turnover (Cr)": r.get("Turnover (Cr)"),
+            "Delivery %": r.get("Delivery %"),
+            "Families agreeing": len(families),
+            "Signals": sum(len(v) for v in ev.values()),
+            "Sources": ", ".join(EVIDENCE_FAMILIES[f] for f in families),
+            "Why": " | ".join(reasons),
+        })
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values(["Families agreeing", "Signals"],
+                           ascending=[False, False]).head(top_n)
+
+
 # ============================================================== GLOSSARY =====
 # Every term the app shows, in plain English. Definitions say what a number
 # measures AND what it does not tell you -- the second half is usually the
 # part that costs money.
 
 GLOSSARY = {
+    "Sources": "Which evidence families contributed.",
+    "Signals": "Total individual reasons found. Less meaningful than families — a stock can have six signals that are all the same observation restated.",
+    "Families agreeing": "How many DIFFERENT kinds of evidence point the same way. Three technical indicators count as one family because they read the same price series; promoter buying and rising delivery are separate observations.",
     "Base median %": "This stock's typical move over the same horizon regardless of state. If the conditional result matches it, the condition told you nothing.",
     "Beyond noise": "Whether the difference from the base rate exceeds two standard errors on the effective sample. Usually false, which is the honest result.",
     "Independent windows": "Matching days divided by the horizon. Overlapping windows share most of their days, so 100 matches over a 10-day horizon is really about 10 independent observations. This is the number that governs reliability.",
@@ -3711,13 +3868,110 @@ st.markdown(f'<div class="pulse-strip">{"".join(cells)}</div>', unsafe_allow_htm
 
 # ================================================================= TABS ======
 
-(tab_market, tab_sent, tab_setups, tab_screen, tab_tech, tab_opt, tab_disc,
- tab_own, tab_journal, tab_hunt, tab_test, tab_news, tab_flows, tab_ratios,
- tab_book, tab_depth) = st.tabs(
-    ["Markets", "Sentiment", "Weekly setups", "Screener (all NSE)", "Technicals",
-     "Options", "Disclosures", "Ownership", "Journal", "Small-cap hunt",
-     "Backtest", "News", "FII / DII", "Ratios", "Order Book", "Depth"]
+(tab_focus, tab_market, tab_sent, tab_setups, tab_screen, tab_tech, tab_opt,
+ tab_disc, tab_own, tab_journal, tab_hunt, tab_test, tab_news, tab_flows,
+ tab_ratios, tab_book, tab_depth) = st.tabs(
+    ["Focus list", "Markets", "Sentiment", "Weekly setups", "Screener (all NSE)",
+     "Technicals", "Options", "Disclosures", "Ownership", "Journal",
+     "Small-cap hunt", "Backtest", "News", "FII / DII", "Ratios", "Order Book",
+     "Depth"]
 )
+
+with tab_focus, safe_tab("Focus list"):
+    st.markdown("#### Focus list")
+    st.markdown(
+        "Stocks where evidence from **different** families lines up — price, "
+        "delivery, ownership, insider activity, filings, valuation. Every row "
+        "shows its reasons, because a score you cannot check is a score you "
+        "should not trust."
+    )
+    glossary_panel("What counts as evidence here?")
+
+    if st.button("Build focus list", type="primary", key="fl_go"):
+        st.session_state["_run_focus"] = True
+
+    if not st.session_state.get("_run_focus"):
+        st.info("Click above. It reads from disk and pulls together every other "
+                "tab, so it takes a few seconds.")
+    else:
+        f1, f2 = st.columns(2)
+        fl_turn = f1.number_input("Min turnover (Cr)", value=3.0, step=1.0,
+                                  key="fl_turn",
+                                  help="Liquidity floor — below this you cannot "
+                                       "exit at the price you see.")
+        fl_fam = f2.number_input("Min families agreeing", value=2, min_value=1,
+                                 max_value=6, step=1, key="fl_fam")
+
+        with st.spinner("Gathering evidence…"):
+            fl_screen, fl_date, _ = load_market_screen()
+            have_hist = HISTORY_DIR.exists() and any(HISTORY_DIR.glob("*.csv.gz"))
+            fl_scan = cached_pattern_scan() if have_hist else pd.DataFrame()
+            fl_setups = cached_setups(fl_turn, 1.5) if have_hist else pd.DataFrame()
+            fl_shp = ownership_trends(load_shareholding(), 4)
+            fl_news = load_news_archive()
+            fl_tagged = (tag_news_with_symbols(fl_news, symbol_universe())
+                         if not fl_news.empty else pd.DataFrame())
+            fl_ratios = st.session_state.get("_ratio_data", pd.DataFrame())
+
+            focus = build_focus_list(fl_screen, fl_setups, fl_scan, fl_shp,
+                                     load_insider(), load_deals(), fl_tagged,
+                                     fl_ratios, fl_turn, 40)
+
+        if focus.empty:
+            st.warning("Nothing surfaced. Either the collectors have not run yet, "
+                       "or nothing currently has corroborating evidence.")
+        else:
+            view = focus[focus["Families agreeing"] >= fl_fam]
+            uni = symbol_universe()
+            if not uni.empty:
+                view = view.merge(uni[["Symbol", "Company"]], on="Symbol", how="left")
+
+            counts = focus["Families agreeing"].value_counts().sort_index(ascending=False)
+            st.caption(f"{len(view)} stocks with {fl_fam}+ families agreeing · "
+                       + " · ".join(f"{k} families: {v}" for k, v in counts.items()))
+
+            lead = [c for c in ["Symbol", "Company", "Families agreeing", "Signals",
+                                "Close", "Day %", "1M %", "Delivery %",
+                                "Turnover (Cr)", "Sources"] if c in view.columns]
+            st.dataframe(colour_frame(view[lead], ["Day %", "1M %"]),
+                         column_config=help_config(view[lead]),
+                         use_container_width=True, height=380, hide_index=True)
+
+            st.divider()
+            st.markdown("**The evidence, name by name**")
+            for _, r in view.head(12).iterrows():
+                name = r.get("Company") or r["Symbol"]
+                st.markdown(
+                    f'<div style="border-left:2px solid #2fbf71;padding:0.6rem 1rem;'
+                    f'background:#141a21;margin:0.4rem 0;">'
+                    f'<div style="font-weight:650;color:#e6eaef;">{name} '
+                    f'<span style="color:#8b95a1;font-weight:400;font-size:0.85rem;">'
+                    f'· {r["Families agreeing"]} families · Rs {r["Close"]:,.2f}'
+                    f'</span></div>'
+                    f'<div style="color:#8b95a1;font-size:0.84rem;margin-top:0.3rem;">'
+                    f'{r["Why"]}</div></div>', unsafe_allow_html=True)
+
+            st.download_button("Download focus list",
+                               data=view.to_csv(index=False).encode("utf-8"),
+                               file_name="focus_list.csv", mime="text/csv",
+                               key="fl_dl")
+
+            st.markdown(
+                '<div class="stale"><b>This is a research queue, not a buy list, '
+                'and the distinction is not a formality.</b> Ranking by families '
+                'in agreement is better than ranking by signal count, because '
+                'three technical indicators all read the same price series while '
+                'promoter buying and rising delivery are genuinely separate '
+                'observations. But agreement is not accuracy — several sources '
+                'can point the same way and all be wrong, and the ones at the top '
+                'are frequently the ones already well known and priced.<br><br>'
+                'What it is good for: turning two thousand stocks into a dozen '
+                'worth an hour of reading. What it cannot do is the reading. The '
+                'thing that separates the names that work from the ones that do '
+                'not — the concall, the order book, whether the promoter is '
+                'credible — is not in any of these columns.</div>',
+                unsafe_allow_html=True)
+
 
 with tab_market, safe_tab("Markets"):
     left, right = st.columns(2)
