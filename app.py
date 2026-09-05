@@ -31,7 +31,15 @@ st.set_page_config(
 )
 
 DATA_DIR = Path(__file__).parent / "data"
-APP_VERSION = "v21 — focus list"
+APP_VERSION = "v22 — options focus"
+
+# Which tabs to show. Trimmed to the options workflow; every other tab is
+# still in this file and comes back by adding its name to this list.
+# Full set: Radar, Trade, Chain, Events, Journal, Backtest, Data, Focus list,
+#           Markets, Sentiment, Weekly setups, Screener, Technicals, Options,
+#           Disclosures, Ownership, Small-cap hunt, News, FII / DII, Ratios,
+#           Order Book, Depth
+VISIBLE_TABS = ["Radar", "Options", "Events", "Journal", "Backtest", "Data"]
 
 
 # ============================================================ DEFAULT DATA ===
@@ -3511,12 +3519,199 @@ def build_focus_list(screen, setups, scan, shp_trends, insider, deals,
                            ascending=[False, False]).head(top_n)
 
 
+# =========================================================== OPTIONS RADAR ===
+# For an option buyer, direction alone loses money. The question is whether
+# the move will be large enough to beat the premium -- so this compares what
+# options are PRICING against what the stock has actually DONE over the same
+# number of days, and flags where a catalyst is coming.
+#
+# Implied move comes from the ATM straddle: buying the call and put at the
+# nearest strike costs roughly what the market expects the move to be by
+# expiry. Historical move comes from your own stored history. When implied
+# sits below historical, options are cheap for the move this stock makes.
+
+def implied_move(fno: pd.DataFrame, symbol: str, expiry) -> dict:
+    """ATM straddle cost as a percentage of spot — the market's expected move."""
+    g = fno[(fno["SYMBOL"] == symbol) & (fno["OPT"].isin(["CE", "PE"]))].copy()
+    if "EXPIRY" in g.columns:
+        g = g[pd.to_datetime(g["EXPIRY"], errors="coerce") == pd.Timestamp(expiry)]
+    if g.empty:
+        return {}
+
+    for c in ("STRIKE", "CLOSE", "UNDERLYING", "OI"):
+        if c in g.columns:
+            g[c] = pd.to_numeric(g[c], errors="coerce")
+    spot_s = g["UNDERLYING"].dropna()
+    if spot_s.empty:
+        return {}
+    spot = float(spot_s.iloc[0])
+
+    atm_strike = g.iloc[(g["STRIKE"] - spot).abs().argsort()[:1]]["STRIKE"].iloc[0]
+    ce = g[(g["OPT"] == "CE") & (g["STRIKE"] == atm_strike)]["CLOSE"]
+    pe = g[(g["OPT"] == "PE") & (g["STRIKE"] == atm_strike)]["CLOSE"]
+    if ce.empty or pe.empty:
+        return {}
+
+    straddle = float(ce.iloc[0]) + float(pe.iloc[0])
+    return {"spot": spot, "atm_strike": float(atm_strike),
+            "straddle": straddle, "implied_move_pct": (straddle / spot) * 100,
+            "call": float(ce.iloc[0]), "put": float(pe.iloc[0])}
+
+
+def historical_move(hist: pd.DataFrame, symbol: str, days: int) -> dict:
+    """
+    How far this stock has actually travelled over `days`, historically.
+
+    Absolute moves, because an option buyer is paid for magnitude in either
+    direction, not for being on the right side of a small one.
+    """
+    g = hist[hist["SYMBOL"] == symbol].sort_values("DATE")
+    closes = pd.Series(g["CLOSE"].values).dropna()
+    if len(closes) < days + 40:
+        return {}
+    moves = ((closes.shift(-days) / closes - 1) * 100).dropna().abs()
+    if moves.empty:
+        return {}
+    return {"median": float(moves.median()), "mean": float(moves.mean()),
+            "p75": float(moves.quantile(0.75)), "p90": float(moves.quantile(0.90)),
+            "beat_rate": float((moves > 0).mean() * 100), "n": int(len(moves))}
+
+
+def options_radar(fno, hist, meetings, iv_hist, tagged_news,
+                  min_oi=200000, max_days=45) -> pd.DataFrame:
+    """
+    Rank F&O underlyings by how attractive they are to trade options on.
+
+    Attractiveness here means: a catalyst is coming, options are liquid, and
+    the implied move is not already above what this stock typically does.
+    Direction is deliberately absent — that is the part the data cannot
+    supply, and pretending otherwise is how option buyers get hurt.
+    """
+    if fno.empty or "OPT" not in fno.columns:
+        return pd.DataFrame()
+
+    opts = fno[fno["OPT"].isin(["CE", "PE"])].copy()
+    opts["OI"] = pd.to_numeric(opts["OI"], errors="coerce")
+    opts["EXPIRY_DT"] = pd.to_datetime(opts["EXPIRY"], errors="coerce")
+    today = pd.Timestamp(datetime.now().date())
+
+    # Results dates, which are the catalysts that matter most
+    events = {}
+    if meetings is not None and not meetings.empty and "SYMBOL" in meetings.columns:
+        soon = meetings[(meetings["MEETING_DATE"] >= today)
+                        & (meetings["MEETING_DATE"] <= today + pd.Timedelta(days=max_days))]
+        for _, r in soon.iterrows():
+            sym = str(r["SYMBOL"]).upper()
+            if sym not in events or r["MEETING_DATE"] < events[sym][0]:
+                events[sym] = (r["MEETING_DATE"], str(r.get("PURPOSE", ""))[:70])
+
+    # Recent filings, as a secondary catalyst
+    filing_counts = {}
+    if tagged_news is not None and not tagged_news.empty:
+        recent = tagged_news[(tagged_news["PUBLISHED_DT"] >= today - pd.Timedelta(days=7))
+                             & (tagged_news["KIND"] == "filing")]
+        filing_counts = recent.groupby("SYMBOL_MATCH").size().to_dict()
+
+    rows = []
+    for sym, g in opts.groupby("SYMBOL"):
+        total_oi = g["OI"].sum()
+        if total_oi < min_oi:
+            continue
+        exps = sorted(g["EXPIRY_DT"].dropna().unique())
+        exps = [e for e in exps if pd.Timestamp(e) >= today]
+        if not exps:
+            continue
+        near = pd.Timestamp(exps[0])
+        dte = (near - today).days
+        if dte <= 0 or dte > max_days:
+            continue
+
+        im = implied_move(opts, sym, near)
+        if not im:
+            continue
+        hm = historical_move(hist, sym, dte) if hist is not None and not hist.empty else {}
+
+        ev_date, ev_what = events.get(sym.upper(), (pd.NaT, ""))
+        ev_days = (ev_date - today).days if pd.notna(ev_date) else None
+
+        iv_r = float("nan")
+        if iv_hist is not None and not iv_hist.empty:
+            h = iv_hist[iv_hist["SYMBOL"] == sym]["ATM_IV"]
+            if len(h):
+                iv_r = iv_rank(h, h.iloc[-1])[0]
+
+        row = {
+            "Symbol": sym,
+            "Spot": im["spot"],
+            "Expiry": near.date(),
+            "Days to expiry": dte,
+            "ATM strike": im["atm_strike"],
+            "Straddle": im["straddle"],
+            "Implied move %": im["implied_move_pct"],
+            "Typical move %": hm.get("median", float("nan")),
+            "Move p75 %": hm.get("p75", float("nan")),
+            "Total OI": total_oi,
+            "IV rank": iv_r,
+            "Event in": ev_days,
+            "Event": ev_what,
+            "Filings 7d": filing_counts.get(sym, 0),
+        }
+
+        # Cheapness: how the market's expected move compares with the real one
+        if row["Typical move %"] == row["Typical move %"] and row["Implied move %"]:
+            row["Implied vs typical"] = row["Implied move %"] / row["Typical move %"]
+        else:
+            row["Implied vs typical"] = float("nan")
+
+        rows.append(row)
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+
+    # Score: catalyst near, options not already expensive, liquidity present.
+    score = pd.Series(0.0, index=out.index)
+    ev = out["Event in"]
+    score += ev.notna().astype(float) * 2                       # a catalyst exists
+    score += ((ev.notna()) & (ev <= out["Days to expiry"])).astype(float) * 2
+    ratio = out["Implied vs typical"]
+    score += (ratio < 1.0).fillna(False).astype(float) * 2      # cheap for the move
+    score += (ratio < 0.8).fillna(False).astype(float) * 1
+    score += (out["IV rank"] < 40).fillna(False).astype(float) * 1
+    score += (out["Filings 7d"] > 0).astype(float) * 1
+    score += (out["Total OI"] > out["Total OI"].median()).astype(float) * 1
+    out["Setup score"] = score
+
+    def read(r):
+        bits = []
+        if pd.notna(r["Event in"]):
+            inside = r["Event in"] <= r["Days to expiry"]
+            bits.append(f"Results in {int(r['Event in'])}d"
+                        + (" (before expiry)" if inside else " (after expiry)"))
+        rr = r["Implied vs typical"]
+        if rr == rr:
+            bits.append("options cheap for its usual move" if rr < 1
+                        else "options pricing more than its usual move")
+        if r["IV rank"] == r["IV rank"]:
+            bits.append(f"IV rank {r['IV rank']:.0f}")
+        return " · ".join(bits) if bits else "liquid, no catalyst found"
+
+    out["Read"] = out.apply(read, axis=1)
+    return out.sort_values("Setup score", ascending=False)
+
+
 # ============================================================== GLOSSARY =====
 # Every term the app shows, in plain English. Definitions say what a number
 # measures AND what it does not tell you -- the second half is usually the
 # part that costs money.
 
 GLOSSARY = {
+    "Event in": "Days until the next board meeting, which is when results are approved.",
+    "Setup score": "Counts catalyst proximity, whether options are cheap for the move, IV rank and liquidity. Not a probability.",
+    "Straddle": "Cost of buying the ATM call and put together. Profits from a large move either way.",
+    "Implied vs typical": "Implied move divided by typical move. Below 1 means options price a smaller move than the stock usually makes. It says nothing about direction.",
+    "Typical move %": "The median absolute move this stock has actually made over the same number of days, from your stored history.",
+    "Implied move %": "What the ATM straddle costs as a share of spot — roughly the move options are pricing by expiry. Not a forecast; it is the price of the bet.",
     "Sources": "Which evidence families contributed.",
     "Signals": "Total individual reasons found. Less meaningful than families — a stock can have six signals that are all the same observation restated.",
     "Families agreeing": "How many DIFFERENT kinds of evidence point the same way. Three technical indicators count as one family because they read the same price series; promoter buying and rising delivery are separate observations.",
@@ -3868,14 +4063,220 @@ st.markdown(f'<div class="pulse-strip">{"".join(cells)}</div>', unsafe_allow_htm
 
 # ================================================================= TABS ======
 
+ALL_TABS = ["Radar", "Options", "Events", "Journal", "Backtest", "Data",
+            "Focus list", "Markets", "Sentiment", "Weekly setups",
+            "Screener (all NSE)", "Technicals", "Disclosures", "Ownership",
+            "Small-cap hunt", "News", "FII / DII", "Ratios", "Order Book",
+            "Depth"]
+
+_shown = [t for t in ALL_TABS if t in VISIBLE_TABS] or ALL_TABS[:1]
+_hidden_names = [t for t in ALL_TABS if t not in _shown]
+_tabs = dict(zip(_shown, st.tabs(_shown)))
+
+# Everything switched off still exists — it renders inside one collapsed
+# section at the bottom rather than being deleted. Nothing is lost, and the
+# top of the app stays as short as the workflow actually needs.
+_overflow = (st.expander(f"Other tools ({len(_hidden_names)})")
+             if _hidden_names else None)
+
+
+def tab(name):
+    return _tabs.get(name, _overflow if _overflow is not None else st.container())
+
+
+tab_radar, tab_events, tab_data = tab("Radar"), tab("Events"), tab("Data")
 (tab_focus, tab_market, tab_sent, tab_setups, tab_screen, tab_tech, tab_opt,
  tab_disc, tab_own, tab_journal, tab_hunt, tab_test, tab_news, tab_flows,
- tab_ratios, tab_book, tab_depth) = st.tabs(
-    ["Focus list", "Markets", "Sentiment", "Weekly setups", "Screener (all NSE)",
-     "Technicals", "Options", "Disclosures", "Ownership", "Journal",
-     "Small-cap hunt", "Backtest", "News", "FII / DII", "Ratios", "Order Book",
-     "Depth"]
-)
+ tab_ratios, tab_book, tab_depth) = (
+    tab("Focus list"), tab("Markets"), tab("Sentiment"), tab("Weekly setups"),
+    tab("Screener (all NSE)"), tab("Technicals"), tab("Options"),
+    tab("Disclosures"), tab("Ownership"), tab("Journal"), tab("Small-cap hunt"),
+    tab("Backtest"), tab("News"), tab("FII / DII"), tab("Ratios"),
+    tab("Order Book"), tab("Depth"))
+
+with tab_radar, safe_tab("Radar"):
+    st.markdown("#### Options radar")
+    st.markdown(
+        "F&O stocks with a catalyst coming, ranked by whether the options are "
+        "**cheap for the move that stock actually makes**. Direction is not "
+        "here — for an option buyer, being right on direction and wrong on "
+        "size still loses."
+    )
+    glossary_panel("What do implied move and IV rank mean?")
+
+    radar_fno = load_fno_latest()
+    if radar_fno.empty:
+        st.info("No F&O data stored yet. Run the collector — see the Data tab.")
+    else:
+        r1, r2, r3 = st.columns(3)
+        r_oi = r1.number_input("Min total OI", value=200000, step=50000, key="rd_oi")
+        r_dte = r2.number_input("Max days to expiry", value=45, step=5, key="rd_dte")
+        r_event = r3.checkbox("Only with a results date", value=False, key="rd_ev")
+
+        with st.spinner("Comparing implied moves against actual ones…"):
+            r_news = load_news_archive()
+            r_tagged = (tag_news_with_symbols(r_news, symbol_universe())
+                        if not r_news.empty else pd.DataFrame())
+            radar = options_radar(radar_fno, cached_history(), load_meetings(),
+                                  load_iv_history(), r_tagged, r_oi, int(r_dte))
+
+        if radar.empty:
+            st.warning("Nothing passed the filters.")
+        else:
+            view = radar[radar["Event in"].notna()] if r_event else radar
+            st.caption(f"{len(view)} underlyings · snapshot {radar_fno['DATE'].iloc[0]}")
+
+            cols = ["Symbol", "Spot", "Days to expiry", "Implied move %",
+                    "Typical move %", "Implied vs typical", "IV rank",
+                    "Event in", "Setup score", "Read"]
+            st.dataframe(
+                colour_frame(view[[c for c in cols if c in view.columns]].head(40),
+                             ["Implied move %", "Typical move %"]),
+                column_config=help_config(view),
+                use_container_width=True, height=420, hide_index=True)
+
+            st.divider()
+            st.markdown("**Top candidates in detail**")
+            for _, r in view.head(6).iterrows():
+                ratio = r["Implied vs typical"]
+                colour = ("#2fbf71" if ratio == ratio and ratio < 1 else "#c9a227")
+                straddle_cost = r["Straddle"]
+                st.markdown(
+                    f'<div style="border-left:3px solid {colour};padding:0.7rem 1rem;'
+                    f'background:#141a21;margin:0.4rem 0;">'
+                    f'<div style="font-weight:650;color:#e6eaef;font-size:1.05rem;">'
+                    f'{r["Symbol"]} <span style="color:#8b95a1;font-weight:400;'
+                    f'font-size:0.85rem;">· Rs {r["Spot"]:,.2f} · expiry '
+                    f'{r["Expiry"]} ({int(r["Days to expiry"])}d)</span></div>'
+                    f'<div style="color:#8b95a1;font-size:0.85rem;margin-top:0.35rem;">'
+                    f'Options price a <b>{r["Implied move %"]:.1f}%</b> move by '
+                    f'expiry. Historically it moves <b>'
+                    f'{r["Typical move %"]:.1f}%</b> over the same span.<br>'
+                    f'ATM straddle costs Rs {straddle_cost:,.2f} at the '
+                    f'{r["ATM strike"]:,.0f} strike.<br>{r["Read"]}</div></div>',
+                    unsafe_allow_html=True)
+
+            st.download_button("Download radar",
+                               data=view.to_csv(index=False).encode("utf-8"),
+                               file_name="options_radar.csv", mime="text/csv",
+                               key="rd_dl")
+
+            st.markdown(
+                '<div class="stale"><b>How to use the implied-vs-typical column.</b> '
+                'Below 1 means the market is pricing a smaller move than this stock '
+                'usually makes — which favours buying options, if a catalyst gives '
+                'a reason for the move. Above 1 means the opposite, and buying '
+                'premium there needs the move to exceed what is already priced. '
+                '<br><br>Two things this cannot tell you. It has no view on '
+                'direction, so a cheap straddle is cheap in both directions and a '
+                'call is your call. And "typical move" is measured over ordinary '
+                'periods — a stock genuinely moves more around results, so options '
+                'looking expensive before an event may be correctly priced rather '
+                'than overpriced.</div>', unsafe_allow_html=True)
+
+
+with tab_events, safe_tab("Events"):
+    st.markdown("#### What's coming")
+    st.caption("Results dates and ex-dates — the catalysts worth positioning around.")
+
+    ev_mtg, ev_act = load_meetings(), load_actions()
+    ev_fno = load_fno_latest()
+    fno_syms = (set(ev_fno["SYMBOL"].dropna().unique()) if not ev_fno.empty else set())
+
+    if ev_mtg.empty and ev_act.empty:
+        st.info("No calendar data yet. Run the collector — see the Data tab.")
+    else:
+        only_fno = st.checkbox("Only stocks with listed options", value=True,
+                               key="ev_fno")
+        today = pd.Timestamp(datetime.now().date())
+
+        if not ev_mtg.empty:
+            m = ev_mtg[(ev_mtg["MEETING_DATE"] >= today)
+                       & (ev_mtg["MEETING_DATE"] <= today + pd.Timedelta(days=45))]
+            if only_fno and fno_syms:
+                m = m[m["SYMBOL"].astype(str).str.upper().isin(
+                    {s.upper() for s in fno_syms})]
+            m = m.sort_values("MEETING_DATE").assign(
+                **{"Days away": lambda d: (d["MEETING_DATE"] - today).dt.days})
+            st.markdown(f"**Results — next 45 days ({len(m)})**")
+            st.dataframe(m[["SYMBOL", "COMPANY", "MEETING_DATE", "Days away",
+                            "PURPOSE"]],
+                         use_container_width=True, height=340, hide_index=True)
+
+        if not ev_act.empty:
+            a = ev_act[(ev_act["EX_DATE"] >= today)
+                       & (ev_act["EX_DATE"] <= today + pd.Timedelta(days=45))]
+            if only_fno and fno_syms:
+                a = a[a["SYMBOL"].astype(str).str.upper().isin(
+                    {s.upper() for s in fno_syms})]
+            st.markdown(f"**Ex-dates — next 45 days ({len(a)})**")
+            st.dataframe(a.sort_values("EX_DATE")[["SYMBOL", "COMPANY",
+                                                   "PURPOSE", "EX_DATE"]],
+                         use_container_width=True, height=260, hide_index=True)
+
+        st.markdown(
+            '<div class="stale">A results date inside your holding period is the '
+            'single most consequential thing on this page for an option buyer. It '
+            'is when the move happens — and also when implied volatility '
+            'collapses, which is why buying premium the day before results so '
+            'often loses even when the direction is right.</div>',
+            unsafe_allow_html=True)
+
+
+with tab_data, safe_tab("Data"):
+    st.markdown("#### What's collected")
+    st.caption("Everything on the Radar depends on these. A gap here is a gap "
+               "in the analysis.")
+
+    def _count(path, label, why):
+        if isinstance(path, Path) and path.is_dir():
+            files = list(path.glob("*.csv.gz"))
+            n = 0
+            for f in files:
+                try:
+                    n += len(pd.read_csv(f, usecols=[0], skipinitialspace=True))
+                except Exception:
+                    pass
+            ok, detail = bool(files), f"{n:,} rows in {len(files)} file(s)"
+        elif isinstance(path, Path) and path.exists():
+            try:
+                n = len(pd.read_csv(path, skipinitialspace=True))
+                ok, detail = True, f"{n:,} rows"
+            except Exception:
+                ok, detail = False, "unreadable"
+        else:
+            ok, detail = False, "not collected yet"
+        return {"Data": label, "Status": "ready" if ok else "missing",
+                "Detail": detail, "Needed for": why}
+
+    status = pd.DataFrame([
+        _count(FNO_DIR, "F&O bhavcopy", "Radar, chain, strike ladder"),
+        _count(HISTORY_DIR, "Equity history", "Typical move, backtest"),
+        _count(MEETINGS_PATH, "Board meetings", "Results catalysts"),
+        _count(ACTIONS_PATH, "Corporate actions", "Ex-dates"),
+        _count(IV_PATH, "IV history", "IV rank"),
+        _count(NEWS_DIR, "News archive", "Filing catalysts"),
+        _count(DEALS_PATH, "Bulk & block deals", "Who is buying"),
+        _count(INSIDER_PATH, "Insider filings", "Promoter activity"),
+    ])
+    st.dataframe(status, use_container_width=True, hide_index=True)
+
+    missing = status[status["Status"] == "missing"]
+    if len(missing):
+        st.markdown(
+            f'<div class="stale">{len(missing)} dataset(s) not collected yet. '
+            'Run the <i>Collect bhavcopy</i> workflow in your repo\'s Actions '
+            'tab — it gathers all of these in one pass, then repeats every '
+            'weekday at 19:30 IST.</div>', unsafe_allow_html=True)
+    else:
+        st.success("All collectors have run.")
+
+    st.caption(
+        "IV rank and the backtest are the two that need time rather than a run "
+        "— they compare today against months of collected history, so they "
+        "improve on their own and cannot be rushed."
+    )
+
 
 with tab_focus, safe_tab("Focus list"):
     st.markdown("#### Focus list")
