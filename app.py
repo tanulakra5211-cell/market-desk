@@ -31,7 +31,7 @@ st.set_page_config(
 )
 
 DATA_DIR = Path(__file__).parent / "data"
-APP_VERSION = "v23"
+APP_VERSION = "v24 — trade card"
 
 # Which tabs to show. Trimmed to the options workflow; every other tab is
 # still in this file and comes back by adding its name to this list.
@@ -39,7 +39,8 @@ APP_VERSION = "v23"
 #           Markets, Sentiment, Weekly setups, Screener, Technicals, Options,
 #           Disclosures, Ownership, Small-cap hunt, News, FII / DII, Ratios,
 #           Order Book, Depth
-VISIBLE_TABS = ["Radar", "Options", "Events", "Journal", "Backtest", "Data"]
+VISIBLE_TABS = ["Radar", "Trade card", "Options", "Events", "Journal",
+                "Backtest", "Data"]
 
 
 # ============================================================ DEFAULT DATA ===
@@ -3700,12 +3701,115 @@ def options_radar(fno, hist, meetings, iv_hist, tagged_news,
     return out.sort_values("Setup score", ascending=False)
 
 
+# =========================================================== TRADE CARD ======
+# The link between a chart level and an option price. Support and resistance
+# are levels on the UNDERLYING; what you actually pay and receive is the
+# premium. Repricing the option at each level, at a chosen number of days
+# forward, turns "resistance at 420" into "this call is worth Rs 28 there".
+#
+# Every premium below is a Black-Scholes valuation, not a quote. Real fills
+# differ, and thinly traded strikes differ a lot.
+
+def option_at_levels(spot, strike, premium, days_to_expiry, iv_pct, is_call,
+                     direction, qty, levels: dict, hold_days: int,
+                     iv_shift: float = 0.0) -> pd.DataFrame:
+    """
+    Option value at each underlying level, after `hold_days` have passed.
+
+    Time is deducted deliberately: an option at the same price two weeks later
+    is worth less, and a target that ignores decay flatters every trade.
+    """
+    t_left = max(days_to_expiry - hold_days, 0) / 365.0
+    vol = max(iv_pct + iv_shift, 0.1) / 100.0
+    sign = 1 if direction == "long" else -1
+
+    rows = []
+    for label, level in levels.items():
+        if level is None or level != level or level <= 0:
+            continue
+        value = bs_price(level, strike, t_left, vol, is_call=is_call)
+        pnl = sign * (value - premium) * qty
+        rows.append({
+            "Level": label,
+            "Underlying": level,
+            "Move %": ((level - spot) / spot) * 100,
+            "Option worth": value,
+            "P&L": pnl,
+            "Return %": (pnl / (premium * qty)) * 100 if premium else float("nan"),
+        })
+    df = pd.DataFrame(rows)
+    return df.sort_values("Underlying") if not df.empty else df
+
+
+def exit_plan(spot, strike, premium, days_to_expiry, iv_pct, is_call,
+              support, resistance, atr_pct) -> dict:
+    """
+    Concrete premium levels to act on, derived from chart structure.
+
+    The stop is set on the UNDERLYING, not on the premium. A premium-based
+    stop gets triggered by time decay and volatility alone, on days the stock
+    has not done anything wrong.
+    """
+    vol = max(iv_pct, 0.1) / 100.0
+    t = days_to_expiry / 365.0
+
+    invalidation = support if is_call else resistance
+    objective = resistance if is_call else support
+
+    # Value the day the level is hit, allowing a realistic number of days for
+    # the move: distance divided by the stock's typical daily range.
+    def days_to(level):
+        if level is None or level != level or atr_pct <= 0:
+            return 0
+        return min(int(abs(level - spot) / spot * 100 / atr_pct) + 1, days_to_expiry)
+
+    out = {"entry_premium": premium}
+
+    if invalidation and invalidation == invalidation:
+        d = days_to(invalidation)
+        stop_val = bs_price(invalidation, strike, max(days_to_expiry - d, 0) / 365.0,
+                            vol, is_call=is_call)
+        out["stop_level"] = invalidation
+        out["stop_premium"] = stop_val
+        out["stop_loss_pct"] = ((stop_val - premium) / premium) * 100 if premium else float("nan")
+        out["stop_days"] = d
+
+    if objective and objective == objective:
+        d = days_to(objective)
+        tgt_val = bs_price(objective, strike, max(days_to_expiry - d, 0) / 365.0,
+                           vol, is_call=is_call)
+        out["target_level"] = objective
+        out["target_premium"] = tgt_val
+        out["target_gain_pct"] = ((tgt_val - premium) / premium) * 100 if premium else float("nan")
+        out["target_days"] = d
+
+    if "stop_premium" in out and "target_premium" in out:
+        risk = premium - out["stop_premium"]
+        reward = out["target_premium"] - premium
+        out["rr"] = reward / risk if risk > 0 else float("nan")
+
+    # Time stop: the point at which decay starts costing more per day than the
+    # position can reasonably recover. Practically, the last third of the life.
+    out["time_stop_days"] = max(int(days_to_expiry * 0.35), 1)
+
+    g = greeks(spot, strike, t, vol, is_call=is_call)
+    out["theta_per_day"] = g["theta"]
+    out["delta"] = g["delta"]
+    out["breakeven"] = (strike + premium) if is_call else (strike - premium)
+    out["breakeven_move_pct"] = ((out["breakeven"] - spot) / spot) * 100
+    return out
+
+
 # ============================================================== GLOSSARY =====
 # Every term the app shows, in plain English. Definitions say what a number
 # measures AND what it does not tell you -- the second half is usually the
 # part that costs money.
 
 GLOSSARY = {
+    "Time stop": "Exit by this day regardless. Decay accelerates in the last third of an option's life.",
+    "Target premium": "What the option would be worth at the next resistance, allowing realistic time for the move.",
+    "Stop premium": "What the option would be worth if the underlying hits the level that invalidates the idea. The stop is set on the underlying, not the premium — a premium stop gets triggered by decay alone.",
+    "Option worth": "Black-Scholes value of the option if the underlying reaches that level, after the chosen holding days. Not a quote.",
     "Event in": "Days until the next board meeting, which is when results are approved.",
     "Setup score": "Counts catalyst proximity, whether options are cheap for the move, IV rank and liquidity. Not a probability.",
     "Straddle": "Cost of buying the ATM call and put together. Profits from a large move either way.",
@@ -4063,7 +4167,8 @@ st.markdown(f'<div class="pulse-strip">{"".join(cells)}</div>', unsafe_allow_htm
 
 # ================================================================= TABS ======
 
-ALL_TABS = ["Radar", "Options", "Events", "Journal", "Backtest", "Data",
+ALL_TABS = ["Radar", "Trade card", "Options", "Events", "Journal",
+            "Backtest", "Data",
             "Focus list", "Markets", "Sentiment", "Weekly setups",
             "Screener (all NSE)", "Technicals", "Disclosures", "Ownership",
             "Small-cap hunt", "News", "FII / DII", "Ratios", "Order Book",
@@ -4090,7 +4195,8 @@ def tab(name):
     return _tabs.get(name, _overflow if _overflow is not None else st.container())
 
 
-tab_radar, tab_events, tab_data = tab("Radar"), tab("Events"), tab("Data")
+tab_radar, tab_card = tab("Radar"), tab("Trade card")
+tab_events, tab_data = tab("Events"), tab("Data")
 (tab_focus, tab_market, tab_sent, tab_setups, tab_screen, tab_tech, tab_opt,
  tab_disc, tab_own, tab_journal, tab_hunt, tab_test, tab_news, tab_flows,
  tab_ratios, tab_book, tab_depth) = (
@@ -4179,6 +4285,219 @@ with tab_radar, safe_tab("Radar"):
                 'periods — a stock genuinely moves more around results, so options '
                 'looking expensive before an event may be correctly priced rather '
                 'than overpriced.</div>', unsafe_allow_html=True)
+
+
+with tab_card, safe_tab("Trade card"):
+    st.markdown("#### Trade card")
+    st.markdown(
+        "Pick an option and get one page: what the chart says, what the news "
+        "says, when results land — and the **premium levels** that match the "
+        "chart's support and resistance."
+    )
+
+    card_fno = load_fno_latest()
+    if card_fno.empty:
+        st.info("No F&O data stored yet. Run the collector — see the Data tab.")
+    else:
+        opts_all = card_fno[card_fno["OPT"].isin(["CE", "PE"])].copy()
+        for c in ("STRIKE", "CLOSE", "UNDERLYING", "OI"):
+            if c in opts_all.columns:
+                opts_all[c] = pd.to_numeric(opts_all[c], errors="coerce")
+
+        k1, k2, k3, k4 = st.columns(4)
+        c_sym = k1.selectbox("Stock", sorted(opts_all["SYMBOL"].dropna().unique()),
+                             key="tc_sym")
+        sub = opts_all[opts_all["SYMBOL"] == c_sym]
+        exps = sorted(pd.to_datetime(sub["EXPIRY"], errors="coerce").dropna().unique())
+        exp_lbl = [pd.Timestamp(e).strftime("%d-%b-%Y") for e in exps]
+        c_exp_l = k2.selectbox("Expiry", exp_lbl, key="tc_exp")
+        c_exp = exps[exp_lbl.index(c_exp_l)]
+        c_type = k3.selectbox("Type", ["CE", "PE"], key="tc_type")
+
+        chain = sub[(pd.to_datetime(sub["EXPIRY"], errors="coerce") == c_exp)
+                    & (sub["OPT"] == c_type)].sort_values("STRIKE")
+        spot_s = sub["UNDERLYING"].dropna()
+        c_spot = float(spot_s.iloc[0]) if len(spot_s) else float("nan")
+
+        if chain.empty or c_spot != c_spot:
+            st.warning("No strikes found for that combination.")
+        else:
+            strikes = chain["STRIKE"].dropna().tolist()
+            near_ix = int(min(range(len(strikes)),
+                              key=lambda i: abs(strikes[i] - c_spot)))
+            c_strike = k4.selectbox("Strike", strikes, index=near_ix, key="tc_strike")
+
+            row = chain[chain["STRIKE"] == c_strike].iloc[0]
+            c_prem = float(row["CLOSE"])
+            snap = card_fno["DATE"].iloc[0]
+            c_dte = max((pd.Timestamp(c_exp) - pd.Timestamp(snap)).days, 1)
+            lot = load_lot_sizes().get(c_sym, 1)
+
+            solved = implied_vol(c_prem, c_spot, c_strike, c_dte / 365.0,
+                                 is_call=(c_type == "CE"))
+            c_iv = solved if solved == solved else 30.0
+
+            # ---------- the underlying, in full ----------
+            with st.spinner("Reading the chart…"):
+                ca = load_chart_analysis(f"{c_sym}.NS")
+
+            st.divider()
+            st.markdown(f"### {c_sym} {c_strike:,.0f} {c_type} · {c_exp_l}")
+            h1, h2, h3, h4 = st.columns(4)
+            h1.metric("Spot", f"{c_spot:,.2f}")
+            h2.metric("Premium", f"{c_prem:,.2f}",
+                      help=f"Lot {lot} — one lot costs Rs {c_prem*lot:,.0f}")
+            h3.metric("IV", f"{c_iv:.1f}%")
+            h4.metric("Days to expiry", c_dte)
+
+            if ca is None:
+                st.warning("No price history for the underlying — levels "
+                           "cannot be derived, so this card is incomplete.")
+                support = resistance = float("nan")
+                atr_pct = 2.0
+            else:
+                pats = detect_patterns(ca["ohlc"])
+                verdict = chart_verdict(pats, ca)
+                colour = {"up": "#2fbf71", "down": "#e5484d",
+                          "flat": "#6b7684"}[verdict["tone"]]
+                support = ca["support"][0] if ca["support"] else ca["lo52"]
+                resistance = ca["resistance"][0] if ca["resistance"] else ca["hi52"]
+                atr_pct = ca["atr_pct"]
+
+                st.markdown(
+                    f'<div style="border-left:3px solid {colour};padding:0.6rem 1rem;'
+                    f'background:#141a21;margin:0.4rem 0;color:#e6eaef;">'
+                    f'<b>Chart: {verdict["stance"]}</b> · RSI {ca["rsi"]:.0f} · '
+                    f'typical daily move {atr_pct:.1f}%<br>'
+                    f'<span style="color:#8b95a1;font-size:0.85rem;">'
+                    f'Support {support:,.2f} · Resistance {resistance:,.2f} · '
+                    f'52W {ca["lo52"]:,.0f}–{ca["hi52"]:,.0f}</span></div>',
+                    unsafe_allow_html=True)
+
+                if pats:
+                    st.caption("Patterns: " + " · ".join(
+                        f"{p[0]}" for p in pats[:5]))
+
+            # ---------- entry and exit, in premium terms ----------
+            st.markdown("#### Where to act")
+            e1, e2 = st.columns(2)
+            hold = e1.slider("Days you expect to hold", 1, max(c_dte, 2),
+                             min(10, c_dte), key="tc_hold")
+            iv_sh = e2.number_input("IV change to assume", value=0.0, step=1.0,
+                                    key="tc_ivsh",
+                                    help="Try -5 if results fall inside the hold.")
+
+            plan = exit_plan(c_spot, c_strike, c_prem, c_dte, c_iv,
+                             c_type == "CE", support, resistance, atr_pct)
+
+            p1, p2, p3, p4 = st.columns(4)
+            p1.metric("Entry premium", f"{c_prem:,.2f}")
+            if "target_premium" in plan:
+                p2.metric("Target premium", f"{plan['target_premium']:,.2f}",
+                          delta=f"{plan['target_gain_pct']:+.0f}%",
+                          help=f"If the underlying reaches "
+                               f"{plan['target_level']:,.2f}")
+            if "stop_premium" in plan:
+                p3.metric("Stop premium", f"{plan['stop_premium']:,.2f}",
+                          delta=f"{plan['stop_loss_pct']:+.0f}%",
+                          help=f"If the underlying reaches "
+                               f"{plan['stop_level']:,.2f}")
+            if "rr" in plan and plan["rr"] == plan["rr"]:
+                p4.metric("Reward : risk", f"{plan['rr']:.2f}")
+
+            st.caption(
+                f"Breakeven {plan['breakeven']:,.2f} — the underlying must move "
+                f"{plan['breakeven_move_pct']:+.1f}% just to get your premium "
+                f"back. Time decay is Rs {plan['theta_per_day']*lot:,.0f} per "
+                f"day per lot. Exit on time by day {plan['time_stop_days']} "
+                f"even if nothing has happened."
+            )
+
+            levels = {}
+            if support == support:
+                levels["Support"] = support
+            levels["Current"] = c_spot
+            if ca is not None:
+                for i, r_ in enumerate(ca["resistance"][:2], 1):
+                    levels[f"Resistance {i}"] = r_
+                for i, s_ in enumerate(ca["support"][1:2], 2):
+                    levels[f"Support {i}"] = s_
+            if resistance == resistance and "Resistance 1" not in levels:
+                levels["Resistance"] = resistance
+
+            tbl = option_at_levels(c_spot, c_strike, c_prem, c_dte, c_iv,
+                                   c_type == "CE", "long", lot, levels,
+                                   hold, iv_sh)
+            if not tbl.empty:
+                st.markdown(f"**What it's worth at each level, {hold} days from now**")
+                st.dataframe(colour_frame(tbl, ["Move %", "P&L", "Return %"]),
+                             column_config=help_config(tbl),
+                             use_container_width=True, hide_index=True)
+
+            if plan.get("rr", 2) < 1:
+                st.markdown(
+                    '<div class="stale"><b>Reward is smaller than risk here.</b> '
+                    'Support sits further from spot than resistance does, so the '
+                    'losing move costs more than the winning one pays. That is '
+                    'not a reason to skip it, but it needs to be right more than '
+                    'half the time to break even — check a different strike or '
+                    'wait for a better entry.</div>', unsafe_allow_html=True)
+
+            # ---------- context: events, news, fundamentals ----------
+            st.markdown("#### What could move it")
+            ev = events_before(c_sym, c_dte)
+            if not ev.empty:
+                inside = ev[ev["Date"] <= pd.Timestamp(datetime.now().date())
+                            + pd.Timedelta(days=hold)]
+                st.dataframe(ev, use_container_width=True, hide_index=True)
+                if not inside.empty:
+                    st.markdown(
+                        '<div class="stale"><b>A scheduled event falls inside '
+                        'your holding window.</b> That is when the move happens '
+                        'and also when implied volatility collapses — set the IV '
+                        'change above to -5 or -10 and see whether the trade '
+                        'still works.</div>', unsafe_allow_html=True)
+            else:
+                st.caption("No results date or ex-date on file before expiry.")
+
+            arch = load_news_archive()
+            if not arch.empty:
+                uni = symbol_universe()
+                row_u = uni[uni["Symbol"] == c_sym]
+                if not row_u.empty:
+                    toks = company_tokens(row_u.iloc[0].get("Company", c_sym), c_sym)
+                    if toks:
+                        pat = "|".join(r"\b" + re.escape(t.title()) + r"\b|\b"
+                                       + re.escape(t.upper()) + r"\b" for t in toks)
+                        hay = (arch["HEADLINE"].fillna("") + " "
+                               + arch["SUMMARY"].fillna(""))
+                        hits = arch[hay.str.contains(pat, regex=True, case=True,
+                                                     na=False)].head(8)
+                        if not hits.empty:
+                            st.markdown("**Recent coverage and filings**")
+                            for _, a in hits.iterrows():
+                                when = (a["PUBLISHED_DT"].strftime("%d %b")
+                                        if pd.notna(a["PUBLISHED_DT"]) else "—")
+                                st.markdown(
+                                    f'<div class="item"><div class="item-meta">'
+                                    f'{a["SOURCE"]} · {when}</div>'
+                                    f'<a href="{a["LINK"]}" target="_blank">'
+                                    f'{a["HEADLINE"]}</a></div>',
+                                    unsafe_allow_html=True)
+                        else:
+                            st.caption("Nothing in the archive mentions this company yet.")
+            else:
+                st.caption("News archive is empty — run the collector.")
+
+            st.markdown(
+                '<div class="stale">Every premium on this page is a '
+                'Black-Scholes valuation from the stored closing price, not a '
+                'live quote. Real fills differ, and thinly traded strikes differ '
+                'a lot — check the actual bid and ask before acting. The levels '
+                'come from the chart, which is the best guide available to where '
+                'buyers and sellers previously showed up, and no guide at all to '
+                'whether they will show up again.</div>',
+                unsafe_allow_html=True)
 
 
 with tab_events, safe_tab("Events"):
