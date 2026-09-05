@@ -31,7 +31,7 @@ st.set_page_config(
 )
 
 DATA_DIR = Path(__file__).parent / "data"
-APP_VERSION = "v22 — options focus"
+APP_VERSION = "v23"
 
 # Which tabs to show. Trimmed to the options workflow; every other tab is
 # still in this file and comes back by adding its name to this list.
@@ -4071,16 +4071,22 @@ ALL_TABS = ["Radar", "Options", "Events", "Journal", "Backtest", "Data",
 
 _shown = [t for t in ALL_TABS if t in VISIBLE_TABS] or ALL_TABS[:1]
 _hidden_names = [t for t in ALL_TABS if t not in _shown]
-_tabs = dict(zip(_shown, st.tabs(_shown)))
 
-# Everything switched off still exists — it renders inside one collapsed
-# section at the bottom rather than being deleted. Nothing is lost, and the
-# top of the app stays as short as the workflow actually needs.
-_overflow = (st.expander(f"Other tools ({len(_hidden_names)})")
-             if _hidden_names else None)
+# Everything switched off still exists — it goes into one extra tab rather
+# than being deleted. This MUST be a tab, not an expander: anything created
+# outside a tab belongs to the main page body, which Streamlit renders under
+# every tab, so an expander here appeared on all of them at once.
+_labels = list(_shown)
+if _hidden_names:
+    _labels.append(f"Other tools ({len(_hidden_names)})")
+
+_created = st.tabs(_labels)
+_tabs = dict(zip(_shown, _created))
+_overflow = _created[-1] if _hidden_names else None
 
 
 def tab(name):
+    """The real tab if visible, otherwise the overflow tab."""
     return _tabs.get(name, _overflow if _overflow is not None else st.container())
 
 
