@@ -31,7 +31,7 @@ st.set_page_config(
 )
 
 DATA_DIR = Path(__file__).parent / "data"
-APP_VERSION = "v25"
+APP_VERSION = "v26 — clearer trade card"
 
 # Which tabs to show. Trimmed to the options workflow; every other tab is
 # still in this file and comes back by adding its name to this list.
@@ -3817,6 +3817,70 @@ def exit_plan(spot, strike, premium, days_to_expiry, iv_pct, is_call,
     return out
 
 
+def pnl_by_move(spot, strike, my_price, days_to_expiry, iv_pct, is_call,
+                qty, hold_days, atr_pct, iv_shift=0.0, steps=None) -> pd.DataFrame:
+    """
+    What you make or lose at each percentage move in the underlying.
+
+    Built around the price YOU paid, with a single time assumption applied
+    everywhere. The earlier version used one number of days for the target and
+    another for the table, which produced a screen where the target said +38%
+    and the table said -17% for the same trade.
+
+    Move buckets are scaled to the stock's own daily range, so a quiet large
+    cap gets a narrow ladder and a volatile smallcap a wide one.
+    """
+    if steps is None:
+        unit = max(atr_pct if atr_pct == atr_pct and atr_pct > 0 else 2.0, 0.5)
+        span = unit * (max(hold_days, 1) ** 0.5)
+        steps = [-2 * span, -1.5 * span, -span, -0.5 * span, 0,
+                 0.5 * span, span, 1.5 * span, 2 * span]
+
+    t_left = max(days_to_expiry - hold_days, 0) / 365.0
+    vol = max(iv_pct + iv_shift, 0.1) / 100.0
+
+    rows = []
+    for pct in steps:
+        level = spot * (1 + pct / 100)
+        value = bs_price(level, strike, t_left, vol, is_call=is_call)
+        pnl = (value - my_price) * qty
+        rows.append({
+            "If stock moves": f"{pct:+.1f}%",
+            "Stock at": level,
+            "Option worth": value,
+            "Your P&L": pnl,
+            "Return on cost %": (pnl / (my_price * qty)) * 100 if my_price else float("nan"),
+        })
+    return pd.DataFrame(rows)
+
+
+def breakeven_move(spot, strike, my_price, days_to_expiry, iv_pct, is_call,
+                   hold_days, iv_shift=0.0):
+    """
+    The move needed to get your money back, at the horizon you plan to hold.
+
+    This is not strike plus premium: that formula is the expiry breakeven. Sell
+    earlier and there is still time value in the option, so the move required
+    is smaller — and the difference is large early in an option's life.
+    """
+    t_left = max(days_to_expiry - hold_days, 0) / 365.0
+    vol = max(iv_pct + iv_shift, 0.1) / 100.0
+
+    lo, hi = (spot * 0.4, spot * 2.5) if is_call else (spot * 0.4, spot * 2.5)
+    for _ in range(80):
+        mid = (lo + hi) / 2
+        val = bs_price(mid, strike, t_left, vol, is_call=is_call)
+        if (val < my_price) == is_call:
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo < spot * 1e-5:
+            break
+    level = (lo + hi) / 2
+    return {"level": level, "move_pct": ((level - spot) / spot) * 100,
+            "expiry_level": (strike + my_price) if is_call else (strike - my_price)}
+
+
 # ============================================================== GLOSSARY =====
 # Every term the app shows, in plain English. Definitions say what a number
 # measures AND what it does not tell you -- the second half is usually the
@@ -4397,70 +4461,83 @@ with tab_card, safe_tab("Trade card"):
                     st.caption("Patterns: " + " · ".join(
                         f"{p[0]}" for p in pats[:5]))
 
-            # ---------- entry and exit, in premium terms ----------
-            st.markdown("#### Where to act")
-            e1, e2 = st.columns(2)
-            hold = e1.slider("Days you expect to hold", 1, max(c_dte, 2),
+            # ---------- your position, in plain terms ----------
+            st.markdown("#### Your position")
+
+            y1, y2, y3 = st.columns(3)
+            my_price = y1.number_input(
+                "Price you paid (or would pay)", value=float(round(c_prem, 2)),
+                min_value=0.01, step=0.05, key="tc_mine",
+                help=f"Market shows {c_prem:,.2f}. Change this to your actual fill.")
+            my_lots = y2.number_input("Lots", value=1, min_value=1, step=1,
+                                      key="tc_lots")
+            hold = y3.slider("Sell after how many days", 1, max(c_dte, 2),
                              min(10, c_dte), key="tc_hold")
-            iv_sh = e2.number_input("IV change to assume", value=0.0, step=1.0,
-                                    key="tc_ivsh",
-                                    help="Try -5 if results fall inside the hold.")
 
-            plan = exit_plan(c_spot, c_strike, c_prem, c_dte, c_iv,
-                             c_type == "CE", support, resistance, atr_pct)
+            qty = int(my_lots) * lot
+            cost = my_price * qty
 
-            p1, p2, p3, p4 = st.columns(4)
-            p1.metric("Entry premium", f"{c_prem:,.2f}")
-            if "target_premium" in plan:
-                p2.metric("Target premium", f"{plan['target_premium']:,.2f}",
-                          delta=f"{plan['target_gain_pct']:+.0f}%",
-                          help=f"If the underlying reaches "
-                               f"{plan['target_level']:,.2f}")
-            if "stop_premium" in plan:
-                p3.metric("Stop premium", f"{plan['stop_premium']:,.2f}",
-                          delta=f"{plan['stop_loss_pct']:+.0f}%",
-                          help=f"If the underlying reaches "
-                               f"{plan['stop_level']:,.2f}")
-            if "rr" in plan and plan["rr"] == plan["rr"]:
-                p4.metric("Reward : risk", f"{plan['rr']:.2f}")
+            iv_sh = st.number_input(
+                "Assume IV changes by", value=0.0, step=1.0, key="tc_ivsh",
+                help="Try -5 if results fall inside your holding window — that "
+                     "is when volatility collapses.")
+
+            be = breakeven_move(c_spot, c_strike, my_price, c_dte, c_iv,
+                                c_type == "CE", hold, iv_sh)
+
+            b1, b2, b3 = st.columns(3)
+            b1.metric("Your cost", f"Rs {cost:,.0f}",
+                      help=f"{my_lots} lot(s) x {lot} x {my_price:,.2f}")
+            b2.metric("Move needed to break even", f"{be['move_pct']:+.1f}%",
+                      help=f"Stock at {be['level']:,.2f} when you sell on day "
+                           f"{hold}. Sooner needs less, because time value "
+                           f"remains.")
+            b3.metric("Lost per day to decay",
+                      f"Rs {abs(greeks(c_spot, c_strike, c_dte/365.0, c_iv/100.0, is_call=(c_type=='CE'))['theta']) * qty:,.0f}",
+                      help="If the stock does not move at all.")
+
+            table = pnl_by_move(c_spot, c_strike, my_price, c_dte, c_iv,
+                                c_type == "CE", qty, hold, atr_pct, iv_sh)
+
+            st.markdown(f"**If the stock moves, and you sell on day {hold}**")
+            st.dataframe(
+                colour_frame(table, ["Your P&L", "Return on cost %"]),
+                column_config={
+                    "If stock moves": st.column_config.TextColumn(width="small"),
+                    "Stock at": st.column_config.NumberColumn(format="%.2f"),
+                    "Option worth": st.column_config.NumberColumn(format="%.2f"),
+                    "Your P&L": st.column_config.NumberColumn(format="%.0f"),
+                    "Return on cost %": st.column_config.NumberColumn(format="%.0f"),
+                },
+                use_container_width=True, hide_index=True)
+
+            flat = table[table["If stock moves"].str.startswith("+0")]
+            if not flat.empty:
+                flat_pnl = float(flat["Your P&L"].iloc[0])
+                st.caption(
+                    f"Read the middle row first. If the stock is **unchanged** "
+                    f"in {hold} days you are at **Rs {flat_pnl:,.0f}** — that is "
+                    f"the cost of simply holding. Everything above the middle "
+                    f"row needs the stock to move your way by more than "
+                    f"{abs(be['move_pct']):.1f}% just to get back to zero."
+                )
+
+            if abs(be["move_pct"]) > atr_pct * (hold ** 0.5) * 1.2:
+                st.markdown(
+                    f'<div class="stale"><b>The breakeven is further than this '
+                    f'stock usually travels.</b> It needs {abs(be["move_pct"]):.1f}% '
+                    f'in {hold} days, while a typical {hold}-day move for it is '
+                    f'about {atr_pct * (hold ** 0.5):.1f}%. That does not make it '
+                    f'impossible, but it means the odds are against this strike — '
+                    f'a nearer strike, or more time, would need less.</div>',
+                    unsafe_allow_html=True)
 
             st.caption(
-                f"Breakeven {plan['breakeven']:,.2f} — the underlying must move "
-                f"{plan['breakeven_move_pct']:+.1f}% just to get your premium "
-                f"back. Time decay is Rs {plan['theta_per_day']*lot:,.0f} per "
-                f"day per lot. Exit on time by day {plan['time_stop_days']} "
-                f"even if nothing has happened."
+                f"Expiry breakeven is {be['expiry_level']:,.2f} "
+                f"({(be['expiry_level'] / c_spot - 1) * 100:+.1f}%). Holding to "
+                f"expiry always needs a bigger move than selling early, because "
+                f"selling early leaves time value in the option."
             )
-
-            levels = {}
-            if support == support:
-                levels["Support"] = support
-            levels["Current"] = c_spot
-            if ca is not None:
-                for i, r_ in enumerate(ca["resistance"][:2], 1):
-                    levels[f"Resistance {i}"] = r_
-                for i, s_ in enumerate(ca["support"][1:2], 2):
-                    levels[f"Support {i}"] = s_
-            if resistance == resistance and "Resistance 1" not in levels:
-                levels["Resistance"] = resistance
-
-            tbl = option_at_levels(c_spot, c_strike, c_prem, c_dte, c_iv,
-                                   c_type == "CE", "long", lot, levels,
-                                   hold, iv_sh)
-            if not tbl.empty:
-                st.markdown(f"**What it's worth at each level, {hold} days from now**")
-                st.dataframe(colour_frame(tbl, ["Move %", "P&L", "Return %"]),
-                             column_config=help_config(tbl),
-                             use_container_width=True, hide_index=True)
-
-            if plan.get("rr", 2) < 1:
-                st.markdown(
-                    '<div class="stale"><b>Reward is smaller than risk here.</b> '
-                    'Support sits further from spot than resistance does, so the '
-                    'losing move costs more than the winning one pays. That is '
-                    'not a reason to skip it, but it needs to be right more than '
-                    'half the time to break even — check a different strike or '
-                    'wait for a better entry.</div>', unsafe_allow_html=True)
 
             # ---------- context: events, news, fundamentals ----------
             st.markdown("#### What could move it")
