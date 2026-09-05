@@ -31,7 +31,7 @@ st.set_page_config(
 )
 
 DATA_DIR = Path(__file__).parent / "data"
-APP_VERSION = "v24 — trade card"
+APP_VERSION = "v25"
 
 # Which tabs to show. Trimmed to the options workflow; every other tab is
 # still in this file and comes back by adding its name to this list.
@@ -3685,9 +3685,10 @@ def options_radar(fno, hist, meetings, iv_hist, tagged_news,
 
     def read(r):
         bits = []
-        if pd.notna(r["Event in"]):
-            inside = r["Event in"] <= r["Days to expiry"]
-            bits.append(f"Results in {int(r['Event in'])}d"
+        ev_in = r.get("Event in")
+        if ev_in is not None and pd.notna(ev_in):
+            inside = ev_in <= r["Days to expiry"]
+            bits.append(f"Results in {int(ev_in)}d"
                         + (" (before expiry)" if inside else " (after expiry)"))
         rr = r["Implied vs typical"]
         if rr == rr:
@@ -3750,18 +3751,34 @@ def exit_plan(spot, strike, premium, days_to_expiry, iv_pct, is_call,
     stop gets triggered by time decay and volatility alone, on days the stock
     has not done anything wrong.
     """
+    if iv_pct != iv_pct:
+        iv_pct = 30.0
     vol = max(iv_pct, 0.1) / 100.0
-    t = days_to_expiry / 365.0
+    t = max(days_to_expiry, 1) / 365.0
 
     invalidation = support if is_call else resistance
     objective = resistance if is_call else support
 
     # Value the day the level is hit, allowing a realistic number of days for
     # the move: distance divided by the stock's typical daily range.
+    #
+    # Note the NaN check is explicit. `atr_pct <= 0` is False when atr_pct is
+    # NaN, so a missing ATR slipped straight through into int(NaN) and raised.
+    # Comparisons never catch NaN; only a self-inequality does.
     def days_to(level):
-        if level is None or level != level or atr_pct <= 0:
+        if level is None or level != level:
             return 0
-        return min(int(abs(level - spot) / spot * 100 / atr_pct) + 1, days_to_expiry)
+        if atr_pct is None or atr_pct != atr_pct or atr_pct <= 0:
+            return 0
+        if spot is None or spot != spot or spot <= 0:
+            return 0
+        try:
+            steps = abs(level - spot) / spot * 100 / atr_pct
+            if steps != steps:
+                return 0
+            return int(min(int(steps) + 1, max(days_to_expiry, 1)))
+        except (ValueError, ZeroDivisionError, OverflowError):
+            return 0
 
     out = {"entry_premium": premium}
 
@@ -3790,7 +3807,7 @@ def exit_plan(spot, strike, premium, days_to_expiry, iv_pct, is_call,
 
     # Time stop: the point at which decay starts costing more per day than the
     # position can reasonably recover. Practically, the last third of the life.
-    out["time_stop_days"] = max(int(days_to_expiry * 0.35), 1)
+    out["time_stop_days"] = max(int(max(days_to_expiry, 1) * 0.35), 1)
 
     g = greeks(spot, strike, t, vol, is_call=is_call)
     out["theta_per_day"] = g["theta"]
@@ -4363,6 +4380,8 @@ with tab_card, safe_tab("Trade card"):
                 support = ca["support"][0] if ca["support"] else ca["lo52"]
                 resistance = ca["resistance"][0] if ca["resistance"] else ca["hi52"]
                 atr_pct = ca["atr_pct"]
+                if atr_pct != atr_pct or atr_pct <= 0:
+                    atr_pct = 2.0   # fallback when ATR could not be computed
 
                 st.markdown(
                     f'<div style="border-left:3px solid {colour};padding:0.6rem 1rem;'
