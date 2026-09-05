@@ -31,7 +31,7 @@ st.set_page_config(
 )
 
 DATA_DIR = Path(__file__).parent / "data"
-APP_VERSION = "v30"
+APP_VERSION = "v31 — trade plan"
 
 # Which tabs to show. Trimmed to the options workflow; every other tab is
 # still in this file and comes back by adding its name to this list.
@@ -4125,6 +4125,115 @@ def recommendation_summary(scored: pd.DataFrame, horizon: int = 5) -> dict:
     }
 
 
+# ============================================================ TRADE PLAN =====
+# Entry, target and stop as PREMIUM levels — the numbers you actually place
+# orders at — with the stock move each one requires, and P&L after costs.
+
+def underlying_for_premium(target_premium, spot, strike, days_left, vol,
+                           is_call, lo_mult=0.5, hi_mult=1.8):
+    """
+    The underlying price at which the option is worth `target_premium`.
+
+    The inverse of Black-Scholes in the spot direction. Needed because a
+    premium target is only actionable if you know what the stock has to do to
+    reach it.
+    """
+    lo, hi = spot * lo_mult, spot * hi_mult
+    for _ in range(90):
+        mid = (lo + hi) / 2
+        val = bs_price(mid, strike, days_left / 365.0, vol, is_call=is_call)
+        if (val < target_premium) == is_call:
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo < spot * 1e-5:
+            break
+    return (lo + hi) / 2
+
+
+def trade_plan(spot, strike, entry_premium, days_to_expiry, iv_pct, is_call,
+               qty, hold_days, support, resistance,
+               target_pct=50.0, stop_pct=30.0, cost_cfg=None) -> pd.DataFrame:
+    """
+    One table: what to enter at, exit at, and stop at — in premium terms.
+
+    Two methods side by side. Fixed percentages of premium are what most
+    people actually use and are simple to place as orders. Chart levels are
+    tied to where the stock has previously turned. They frequently disagree,
+    and the disagreement is informative: a chart stop far below a 30% premium
+    stop means the trade needs more room than the strike gives it.
+    """
+    vol = max(iv_pct, 0.1) / 100.0
+    days_left = max(days_to_expiry - hold_days, 0)
+
+    def premium_at(level):
+        return bs_price(level, strike, days_left / 365.0, vol, is_call=is_call)
+
+    def move_for(premium_level):
+        lvl = underlying_for_premium(premium_level, spot, strike, days_left,
+                                     vol, is_call)
+        return lvl, ((lvl - spot) / spot) * 100
+
+    rows = [{"Plan": "Entry", "Premium": entry_premium, "Stock needs to be": spot,
+             "Stock move": 0.0, "P&L after costs": 0.0, "Return %": 0.0}]
+
+    candidates = []
+    # method 1: fixed percentage of premium
+    candidates.append(("Target — fixed %", entry_premium * (1 + target_pct / 100)))
+    candidates.append(("Stop — fixed %", entry_premium * (1 - stop_pct / 100)))
+    # method 2: chart levels
+    if resistance == resistance and resistance:
+        lvl = resistance if is_call else support
+        if lvl == lvl and lvl:
+            candidates.append(("Target — chart level", premium_at(lvl)))
+    if support == support and support:
+        lvl = support if is_call else resistance
+        if lvl == lvl and lvl:
+            candidates.append(("Stop — chart level", premium_at(lvl)))
+
+    for label, prem in candidates:
+        if prem is None or prem != prem or prem < 0:
+            continue
+        prem = max(prem, 0.05)
+        lvl, move = move_for(prem)
+        costs = option_trade_costs(entry_premium, prem, qty, cost_cfg)
+        rows.append({
+            "Plan": label, "Premium": prem, "Stock needs to be": lvl,
+            "Stock move": move, "P&L after costs": costs["Net P&L"],
+            "Return %": (costs["Net P&L"] / (entry_premium * qty)) * 100,
+        })
+
+    df = pd.DataFrame(rows)
+    order = {"Entry": 0, "Target — fixed %": 1, "Target — chart level": 2,
+             "Stop — fixed %": 3, "Stop — chart level": 4}
+    df["_o"] = df["Plan"].map(order).fillna(9)
+    return df.sort_values("_o").drop(columns="_o").reset_index(drop=True)
+
+
+def plan_summary(plan: pd.DataFrame, entry_premium, qty) -> dict:
+    """Reward-to-risk for each method, after costs."""
+    if plan.empty:
+        return {}
+    out = {}
+    for method, tkey, skey in [("fixed", "Target — fixed %", "Stop — fixed %"),
+                               ("chart", "Target — chart level", "Stop — chart level")]:
+        t = plan[plan["Plan"] == tkey]
+        s = plan[plan["Plan"] == skey]
+        if t.empty or s.empty:
+            continue
+        gain = float(t["P&L after costs"].iloc[0])
+        loss = abs(float(s["P&L after costs"].iloc[0]))
+        out[method] = {
+            "gain": gain, "loss": loss,
+            "rr": gain / loss if loss > 0 else float("nan"),
+            "target_premium": float(t["Premium"].iloc[0]),
+            "stop_premium": float(s["Premium"].iloc[0]),
+            "target_move": float(t["Stock move"].iloc[0]),
+            "stop_move": float(s["Stock move"].iloc[0]),
+        }
+    return out
+
+
 # ============================================================== GLOSSARY =====
 # Every term the app shows, in plain English. Definitions say what a number
 # measures AND what it does not tell you -- the second half is usually the
@@ -4889,22 +4998,88 @@ with tab_card, safe_tab("Trade card"):
                       f"Rs {abs(greeks(c_spot, c_strike, c_dte/365.0, c_iv/100.0, is_call=(c_type=='CE'))['theta']) * qty:,.0f}",
                       help="If the stock does not move at all.")
 
+            st.markdown("#### Your trade plan")
+            g1, g2 = st.columns(2)
+            tgt_pct = g1.number_input("Target: premium up %", value=50.0, step=10.0,
+                                      key="tc_tgt")
+            stp_pct = g2.number_input("Stop: premium down %", value=30.0, step=5.0,
+                                      key="tc_stp")
+
+            plan = trade_plan(c_spot, c_strike, my_price, c_dte, c_iv,
+                              c_type == "CE", qty, hold, support, resistance,
+                              tgt_pct, stp_pct)
+            summ = plan_summary(plan, my_price, qty)
+
+            st.dataframe(
+                colour_frame(plan, ["Stock move", "P&L after costs", "Return %"]),
+                column_config={
+                    "Plan": st.column_config.TextColumn(width="medium"),
+                    "Premium": st.column_config.NumberColumn(
+                        "Premium", format="%.2f",
+                        help="The price to place your order at."),
+                    "Stock needs to be": st.column_config.NumberColumn(format="%.2f"),
+                    "Stock move": st.column_config.NumberColumn(
+                        "Stock move", format="%.2f%%",
+                        help="What the underlying must do for the premium to "
+                             "reach that level."),
+                    "P&L after costs": st.column_config.NumberColumn(format="%.0f"),
+                    "Return %": st.column_config.NumberColumn(format="%.0f%%"),
+                },
+                use_container_width=True, hide_index=True)
+
+            if summ:
+                cols = st.columns(len(summ))
+                for col, (method, v) in zip(cols, summ.items()):
+                    label = ("Fixed %" if method == "fixed" else "Chart levels")
+                    col.metric(f"{label} — reward:risk", f"{v['rr']:.2f}",
+                               help=f"Make Rs {v['gain']:,.0f} at target, "
+                                    f"lose Rs {v['loss']:,.0f} at stop, "
+                                    f"both after costs.")
+
+            # The single most useful warning this app produces: a premium-based
+            # stop that triggers on a move smaller than the stock's daily noise.
+            fixed = summ.get("fixed")
+            if fixed:
+                noise = atr_pct
+                if abs(fixed["stop_move"]) < noise:
+                    st.markdown(
+                        f'<div class="stale"><b>Your {stp_pct:.0f}% stop triggers '
+                        f'on a {abs(fixed["stop_move"]):.2f}% move in the stock — '
+                        f'smaller than its normal daily range of {noise:.1f}%.</b> '
+                        f'You would be stopped out on an ordinary day when '
+                        f'nothing had gone wrong. Options lose value fast on '
+                        f'small adverse moves, so a percentage stop on premium '
+                        f'is far tighter than it sounds. Either widen it, or use '
+                        f'the chart stop, which needs a '
+                        f'{abs(summ.get("chart", {}).get("stop_move", 0)):.1f}% '
+                        f'move — a real signal rather than noise.</div>',
+                        unsafe_allow_html=True)
+
+            if "chart" in summ and "fixed" in summ:
+                st.caption(
+                    f"The two methods disagree, which is normal and worth "
+                    f"reading. Fixed percentages are easy to place as orders "
+                    f"but ignore where the stock actually turns. Chart levels "
+                    f"respect structure but can sit further away than the "
+                    f"premium can absorb — here the chart stop is "
+                    f"{abs(summ['chart']['stop_move']):.1f}% away against "
+                    f"{abs(summ['fixed']['stop_move']):.2f}% for the fixed one."
+                )
+
+            st.divider()
+            st.markdown(f"**Full picture if you sell on day {hold}**")
             table = pnl_by_move(c_spot, c_strike, my_price, c_dte, c_iv,
                                 c_type == "CE", qty, hold, atr_pct, iv_sh)
 
-            # Visible sanity check: with no move and no time passed, the model
-            # must value the option at exactly what it trades for. If it does
-            # not, every row below is wrong and you should see that.
             zero_day = bs_price(c_spot, c_strike, c_dte / 365.0, c_iv / 100.0,
                                 is_call=(c_type == "CE"))
             if abs(zero_day - c_prem) > max(0.02, c_prem * 0.02):
                 st.error(
                     f"Sanity check failed: with no move and no time elapsed the "
                     f"model values this option at {zero_day:,.2f} but it trades "
-                    f"at {c_prem:,.2f}. Do not rely on the table below."
+                    f"at {c_prem:,.2f}. Do not rely on the numbers above."
                 )
 
-            st.markdown(f"**If the stock moves, and you sell on day {hold}**")
             st.dataframe(
                 colour_frame(table, ["Your P&L", "Return on cost %"]),
                 column_config={
@@ -4918,31 +5093,13 @@ with tab_card, safe_tab("Trade card"):
 
             flat = table[table["If stock moves"].str.startswith("+0")]
             if not flat.empty:
-                flat_pnl = float(flat["Your P&L"].iloc[0])
                 st.caption(
-                    f"Read the middle row first. If the stock is **unchanged** "
-                    f"in {hold} days you are at **Rs {flat_pnl:,.0f}** — that is "
-                    f"the cost of simply holding. Everything above the middle "
-                    f"row needs the stock to move your way by more than "
-                    f"{abs(be['move_pct']):.1f}% just to get back to zero."
+                    f"If the stock is unchanged in {hold} days you are at "
+                    f"**Rs {float(flat['Your P&L'].iloc[0]):,.0f}** — the cost "
+                    f"of simply holding. Breakeven needs "
+                    f"{be['move_pct']:+.1f}% by then; at expiry it needs "
+                    f"{(be['expiry_level'] / c_spot - 1) * 100:+.1f}%."
                 )
-
-            if abs(be["move_pct"]) > atr_pct * (hold ** 0.5) * 1.2:
-                st.markdown(
-                    f'<div class="stale"><b>The breakeven is further than this '
-                    f'stock usually travels.</b> It needs {abs(be["move_pct"]):.1f}% '
-                    f'in {hold} days, while a typical {hold}-day move for it is '
-                    f'about {atr_pct * (hold ** 0.5):.1f}%. That does not make it '
-                    f'impossible, but it means the odds are against this strike — '
-                    f'a nearer strike, or more time, would need less.</div>',
-                    unsafe_allow_html=True)
-
-            st.caption(
-                f"Expiry breakeven is {be['expiry_level']:,.2f} "
-                f"({(be['expiry_level'] / c_spot - 1) * 100:+.1f}%). Holding to "
-                f"expiry always needs a bigger move than selling early, because "
-                f"selling early leaves time value in the option."
-            )
 
             # ---------- context: events, news, fundamentals ----------
             st.markdown("#### What could move it")
