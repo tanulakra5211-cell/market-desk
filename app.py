@@ -31,7 +31,7 @@ st.set_page_config(
 )
 
 DATA_DIR = Path(__file__).parent / "data"
-APP_VERSION = "v27"
+APP_VERSION = "v29 — IV self-check"
 
 # Which tabs to show. Trimmed to the options workflow; every other tab is
 # still in this file and comes back by adding its name to this list.
@@ -3881,6 +3881,56 @@ def breakeven_move(spot, strike, my_price, days_to_expiry, iv_pct, is_call,
             "expiry_level": (strike + my_price) if is_call else (strike - my_price)}
 
 
+def iv_in_plain_words(iv_pct, days, spot, iv_rank_val=None) -> dict:
+    """
+    Translate implied volatility into what it means for this trade.
+
+    IV is quoted annualised, which is why "16%" feels meaningless on a 25-day
+    option. Converting it back to a daily move and an expiry range is the
+    thing that makes it usable.
+    """
+    if iv_pct is None or iv_pct != iv_pct or iv_pct <= 0:
+        return {}
+
+    daily = iv_pct / (252 ** 0.5)
+    period = iv_pct * ((max(days, 1) / 365) ** 0.5)
+
+    # Bands are rough and Indian-equity specific: single stocks here sit around
+    # 25-35% in ordinary conditions, indices lower, and results push both up.
+    if iv_pct < 18:
+        level, tone = "Low", "cheap"
+        meaning = ("The market expects this to be quiet. Options are cheap, but "
+                   "cheap because nothing much is expected to happen.")
+    elif iv_pct < 30:
+        level, tone = "Normal", "fair"
+        meaning = "Ordinary pricing for an Indian single stock."
+    elif iv_pct < 45:
+        level, tone = "High", "expensive"
+        meaning = ("Something is expected — results, news, or a recent sharp "
+                   "move. You are paying up for that expectation.")
+    else:
+        level, tone = "Very high", "very expensive"
+        meaning = ("A big move is being priced in. Buying here needs a move "
+                   "bigger than an already large expectation, and if the event "
+                   "passes quietly the premium collapses.")
+
+    rank_note = ""
+    if iv_rank_val is not None and iv_rank_val == iv_rank_val:
+        if iv_rank_val >= 70:
+            rank_note = (f"Against its own past year this is expensive "
+                         f"(IV rank {iv_rank_val:.0f}) — dearer than it has "
+                         f"been {iv_rank_val:.0f}% of the time.")
+        elif iv_rank_val <= 30:
+            rank_note = (f"Against its own past year this is cheap "
+                         f"(IV rank {iv_rank_val:.0f}).")
+        else:
+            rank_note = f"Middling against its own past year (IV rank {iv_rank_val:.0f})."
+
+    return {"level": level, "tone": tone, "meaning": meaning,
+            "daily": daily, "period": period, "rank_note": rank_note,
+            "low": spot * (1 - period / 100), "high": spot * (1 + period / 100)}
+
+
 # ============================================================== GLOSSARY =====
 # Every term the app shows, in plain English. Definitions say what a number
 # measures AND what it does not tell you -- the second half is usually the
@@ -4068,8 +4118,10 @@ GLOSSARY = {
     "Vega / 1% IV": "Rupees gained or lost per one point change in implied "
         "volatility. Why options can fall after good news — the event passes "
         "and volatility collapses.",
-    "IV": "Implied volatility — the volatility the current price implies. Not a "
-        "forecast; it is what the market is charging.",
+    "IV": "Implied volatility — how much movement the option's price implies. "
+        "Solved backwards from the premium, not measured from the chart. High "
+        "means the option is expensive and a big move is expected; low means "
+        "cheap and quiet. It says nothing about direction.",
     "IV %": "Implied volatility, solved from the option's closing price.",
     "ATM IV %": "Implied volatility at the strike nearest the current price.",
     "IV rank": "Where today's implied volatility sits between this underlying's "
@@ -4416,7 +4468,39 @@ with tab_card, safe_tab("Trade card"):
 
             solved = implied_vol(c_prem, c_spot, c_strike, c_dte / 365.0,
                                  is_call=(c_type == "CE"))
-            c_iv = solved if solved == solved else 30.0
+            c_iv = solved
+
+            # Consistency check. Everything on this card is priced off c_iv, so
+            # if that volatility does not reproduce the premium it came from,
+            # every number below is wrong. The previous version substituted a
+            # flat 30% when the solve failed, which valued options far above
+            # what they trade for and produced impossible results — a position
+            # showing +308% profit before the stock had moved.
+            iv_ok = False
+            iv_problem = ""
+            if solved == solved:
+                recon = bs_price(c_spot, c_strike, c_dte / 365.0, solved / 100.0,
+                                 is_call=(c_type == "CE"))
+                drift = abs(recon - c_prem)
+                iv_ok = drift < max(0.01, c_prem * 0.01)
+                if not iv_ok:
+                    iv_problem = (f"the solved volatility reprices this option at "
+                                  f"{recon:,.2f} against the {c_prem:,.2f} it was "
+                                  f"derived from")
+            else:
+                intrinsic = max((c_spot - c_strike) if c_type == "CE"
+                                else (c_strike - c_spot), 0.0)
+                if c_prem < intrinsic:
+                    iv_problem = (f"the stored premium of {c_prem:,.2f} is below "
+                                  f"this option's intrinsic value of "
+                                  f"{intrinsic:,.2f}, which cannot happen in a "
+                                  f"live market — the close is stale or wrong")
+                elif c_prem <= 0.05:
+                    iv_problem = (f"the premium of {c_prem:,.2f} is too small to "
+                                  f"solve a meaningful volatility from")
+                else:
+                    iv_problem = ("no volatility reproduces this premium — the "
+                                  "strike probably barely traded")
 
             # ---------- the underlying, in full ----------
             with st.spinner("Reading the chart…"):
@@ -4432,6 +4516,83 @@ with tab_card, safe_tab("Trade card"):
                       help="Solved from the premium, not measured from the chart. "
                            "It is the option's price expressed as volatility.")
             h4.metric("Days to expiry", c_dte)
+
+            if not iv_ok:
+                st.markdown(
+                    f'<div style="border-left:3px solid #e5484d;padding:0.9rem 1.1rem;'
+                    f'background:#2a1618;margin:0.6rem 0;color:#f5d7d8;">'
+                    f'<b>This strike cannot be valued reliably.</b><br>'
+                    f'<span style="font-size:0.88rem;">Because {iv_problem}. '
+                    f'Rather than substitute a made-up volatility and show you '
+                    f'confident numbers built on it, the calculations below are '
+                    f'switched off.<br><br>'
+                    f'This normally means the strike barely traded, so its '
+                    f'closing price is stale or a single odd print. Pick a '
+                    f'strike nearer the money, or one with meaningful open '
+                    f'interest on the Options tab.</span></div>',
+                    unsafe_allow_html=True)
+                st.stop()
+
+            plain = iv_in_plain_words(c_iv, c_dte, c_spot)
+            if plain:
+                tone_colour = {"cheap": "#2fbf71", "fair": "#6b7684",
+                               "expensive": "#c9a227",
+                               "very expensive": "#e5484d"}[plain["tone"]]
+                st.markdown(
+                    f'<div style="border-left:3px solid {tone_colour};'
+                    f'padding:0.75rem 1.1rem;background:#141a21;margin:0.5rem 0;'
+                    f'color:#e6eaef;">'
+                    f'<b>What the {c_iv:.0f}% IV means:</b> the market is pricing '
+                    f'this stock to move about <b>{plain["daily"]:.1f}% on a '
+                    f'typical day</b>, or roughly <b>±{plain["period"]:.1f}%</b> '
+                    f'by expiry — somewhere between '
+                    f'<b>{plain["low"]:,.0f}</b> and <b>{plain["high"]:,.0f}</b>.'
+                    f'<br><span style="color:#8b95a1;font-size:0.87rem;">'
+                    f'{plain["level"]} for an Indian stock — options here are '
+                    f'{plain["tone"]}. {plain["meaning"]} {plain["rank_note"]}'
+                    f'</span></div>', unsafe_allow_html=True)
+
+            with st.expander("What is IV, in plain language?"):
+                st.markdown(
+                    "An option's price has one thing in it you cannot look up: "
+                    "**how much the market thinks the stock will move.** "
+                    "Everything else is known — the stock price, the strike, the "
+                    "days left, interest rates. So if you know what the option "
+                    "costs, you can work backwards and solve for that one "
+                    "unknown. That number is the implied volatility."
+                    "\n\n"
+                    "Think of house insurance. A policy costs more in a flood "
+                    "zone. Knowing the premium and everything else about the "
+                    "house, you can back out how risky the insurer thinks the "
+                    "location is. IV is the same idea — the movement the "
+                    "option's price implies."
+                    "\n\n"
+                    "**High IV** means the option is expensive. The market "
+                    "expects a big move — usually results are near, or the stock "
+                    "has just moved sharply. You are paying more, and you need a "
+                    "bigger move to profit."
+                    "\n\n"
+                    "**Low IV** means the option is cheap. The market expects "
+                    "things to stay quiet. You pay less, but it is cheap for a "
+                    "reason: nothing much is expected to happen."
+                    "\n\n"
+                    "**IV says nothing about direction.** High IV does not mean "
+                    "up, and low IV does not mean down. It is only about the "
+                    "size of the expected move."
+                    "\n\n"
+                    "**Why it matters most.** You do not simply need the stock "
+                    "to rise. You need it to rise **more than the premium "
+                    "already assumes**. And after results, uncertainty "
+                    "disappears, so IV drops and the option can lose value even "
+                    "when the stock moved your way. That single effect catches "
+                    "out more option buyers than anything else — it is what the "
+                    "*assume IV changes by* box below lets you test."
+                    "\n\n"
+                    "Rough guide for Indian single stocks: **under 18%** quiet, "
+                    "**18–30%** normal, **30–45%** something is expected, "
+                    "**above 45%** a large move is being priced in. Indices "
+                    "usually run lower than single stocks."
+                )
 
             # The IV is derived, so its inputs are shown. Any number the app
             # computes should be checkable against the numbers that produced it.
@@ -4459,16 +4620,7 @@ with tab_card, safe_tab("Trade card"):
                     f"{c_iv * ((c_dte / 365) ** 0.5):.1f}% over the "
                     f"{c_dte} days to expiry."
                 )
-                if solved != solved:
-                    st.warning(
-                        "No implied volatility could be solved from this "
-                        "premium — a default of 30% is being used. Usually the "
-                        "stored close is below intrinsic value or the strike "
-                        "barely traded, so treat every number on this card as "
-                        "unreliable and check the live quote."
-                    )
-                else:
-                    st.caption(
+                st.caption(
                         "The premium is a stored **closing** price. On a thinly "
                         "traded strike that can be stale or a single odd print, "
                         "which moves the IV a long way. Compare against the live "
@@ -4512,7 +4664,9 @@ with tab_card, safe_tab("Trade card"):
             my_price = y1.number_input(
                 "Price you paid (or would pay)", value=float(round(c_prem, 2)),
                 min_value=0.01, step=0.05, key="tc_mine",
-                help=f"Market shows {c_prem:,.2f}. Change this to your actual fill.")
+                help=f"Defaults to the last traded price of {c_prem:,.2f}. If you "
+                     f"leave it there, the unchanged-stock row should show a "
+                     f"small loss from time decay — never a profit.")
             my_lots = y2.number_input("Lots", value=1, min_value=1, step=1,
                                       key="tc_lots")
             hold = y3.slider("Sell after how many days", 1, max(c_dte, 2),
@@ -4542,6 +4696,18 @@ with tab_card, safe_tab("Trade card"):
 
             table = pnl_by_move(c_spot, c_strike, my_price, c_dte, c_iv,
                                 c_type == "CE", qty, hold, atr_pct, iv_sh)
+
+            # Visible sanity check: with no move and no time passed, the model
+            # must value the option at exactly what it trades for. If it does
+            # not, every row below is wrong and you should see that.
+            zero_day = bs_price(c_spot, c_strike, c_dte / 365.0, c_iv / 100.0,
+                                is_call=(c_type == "CE"))
+            if abs(zero_day - c_prem) > max(0.02, c_prem * 0.02):
+                st.error(
+                    f"Sanity check failed: with no move and no time elapsed the "
+                    f"model values this option at {zero_day:,.2f} but it trades "
+                    f"at {c_prem:,.2f}. Do not rely on the table below."
+                )
 
             st.markdown(f"**If the stock moves, and you sell on day {hold}**")
             st.dataframe(
