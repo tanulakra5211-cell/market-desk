@@ -31,7 +31,7 @@ st.set_page_config(
 )
 
 DATA_DIR = Path(__file__).parent / "data"
-APP_VERSION = "v29 — IV self-check"
+APP_VERSION = "v30"
 
 # Which tabs to show. Trimmed to the options workflow; every other tab is
 # still in this file and comes back by adding its name to this list.
@@ -39,8 +39,8 @@ APP_VERSION = "v29 — IV self-check"
 #           Markets, Sentiment, Weekly setups, Screener, Technicals, Options,
 #           Disclosures, Ownership, Small-cap hunt, News, FII / DII, Ratios,
 #           Order Book, Depth
-VISIBLE_TABS = ["Radar", "Trade card", "Options", "Events", "Journal",
-                "Backtest", "Data"]
+VISIBLE_TABS = ["Radar", "Trade card", "Reality check", "Media calls",
+                "Options", "Events", "Journal", "Backtest", "Data"]
 
 
 # ============================================================ DEFAULT DATA ===
@@ -3931,6 +3931,200 @@ def iv_in_plain_words(iv_pct, days, spot, iv_rank_val=None) -> dict:
             "low": spot * (1 - period / 100), "high": spot * (1 + period / 100)}
 
 
+# ========================================================= COSTS & RUIN ======
+# Two things that decide outcomes more reliably than any signal: what trading
+# costs you, and what a normal losing streak does to your capital.
+
+# Defaults for Indian options as of writing. Rates change and differ by broker,
+# so every one of these is editable in the UI rather than baked in.
+DEFAULT_COSTS = {
+    "brokerage_per_order": 20.0,   # flat per executed order at discount brokers
+    "stt_sell_pct": 0.10,          # STT on the SELL side, on premium
+    "exchange_pct": 0.035,         # exchange transaction charge on premium
+    "sebi_per_cr": 10.0,           # SEBI turnover fee per crore
+    "stamp_buy_pct": 0.003,        # stamp duty, buy side
+    "gst_pct": 18.0,               # GST on brokerage + exchange charges
+    "slippage_pct": 1.0,           # half the bid-ask you actually cross, each way
+}
+
+
+def option_trade_costs(premium_buy, premium_sell, qty, c=None) -> dict:
+    """
+    Full round-trip cost of one options trade.
+
+    Slippage is included because it is usually the largest line and the one
+    people leave out: on a wide bid-ask you lose it entering AND exiting.
+    """
+    c = {**DEFAULT_COSTS, **(c or {})}
+    buy_val = premium_buy * qty
+    sell_val = premium_sell * qty
+
+    brokerage = c["brokerage_per_order"] * 2
+    stt = sell_val * c["stt_sell_pct"] / 100
+    exch = (buy_val + sell_val) * c["exchange_pct"] / 100
+    sebi = (buy_val + sell_val) * c["sebi_per_cr"] / 1e7
+    stamp = buy_val * c["stamp_buy_pct"] / 100
+    gst = (brokerage + exch) * c["gst_pct"] / 100
+    slip = (buy_val + sell_val) * c["slippage_pct"] / 100
+
+    total = brokerage + stt + exch + sebi + stamp + gst + slip
+    gross = sell_val - buy_val
+    return {
+        "Brokerage": brokerage, "STT": stt, "Exchange": exch, "SEBI": sebi,
+        "Stamp duty": stamp, "GST": gst, "Slippage": slip,
+        "Total cost": total, "Gross P&L": gross, "Net P&L": gross - total,
+        "Cost as % of capital": (total / buy_val) * 100 if buy_val else float("nan"),
+        "Breakeven move on premium %": (total / buy_val) * 100 if buy_val else float("nan"),
+    }
+
+
+def simulate_drawdown(capital, risk_pct, win_rate, avg_win_r, trades=200,
+                      runs=2000, seed=7) -> dict:
+    """
+    Many random orderings of the same trade statistics.
+
+    The order matters enormously and people forget it. A strategy with a
+    positive expectancy still ruins accounts when the losses happen to arrive
+    consecutively, which they eventually do.
+    """
+    import numpy as np
+    rng = np.random.default_rng(seed)
+    risk = risk_pct / 100.0
+
+    finals, max_dds, ruined = [], [], 0
+    for _ in range(runs):
+        eq = capital
+        peak = capital
+        worst = 0.0
+        for _ in range(trades):
+            stake = eq * risk
+            if rng.random() < win_rate / 100.0:
+                eq += stake * avg_win_r
+            else:
+                eq -= stake
+            peak = max(peak, eq)
+            worst = max(worst, (peak - eq) / peak if peak > 0 else 0)
+            if eq <= capital * 0.25:
+                ruined += 1
+                break
+        finals.append(eq)
+        max_dds.append(worst * 100)
+
+    finals = np.array(finals)
+    max_dds = np.array(max_dds)
+    expectancy = (win_rate / 100) * avg_win_r - (1 - win_rate / 100)
+    return {
+        "expectancy_r": expectancy,
+        "median_final": float(np.median(finals)),
+        "p10_final": float(np.percentile(finals, 10)),
+        "p90_final": float(np.percentile(finals, 90)),
+        "median_drawdown": float(np.median(max_dds)),
+        "worst_drawdown": float(np.percentile(max_dds, 95)),
+        "ruin_pct": ruined / runs * 100,
+        "losing_runs_pct": float((finals < capital).mean() * 100),
+    }
+
+
+# ================================================ RECOMMENDATION TRACKER =====
+# Media calls are easy to remember when they work and easy to forget when they
+# do not. This measures them: find recommendation headlines in the archive,
+# tag the stock, and check what actually happened afterwards — against the
+# base rate for the same stock over the same window.
+
+REC_TERMS = ["buy", "target price", "target of", "upgrade", "upgraded",
+             "top pick", "stock pick", "accumulate", "outperform",
+             "add to portfolio", "bullish on", "recommends"]
+
+
+def find_recommendations(tagged_news: pd.DataFrame) -> pd.DataFrame:
+    """Headlines that read like a recommendation, already tagged to a symbol."""
+    if tagged_news is None or tagged_news.empty:
+        return pd.DataFrame()
+    pattern = "|".join(re.escape(t) for t in REC_TERMS)
+    mask = tagged_news["HEADLINE"].fillna("").str.contains(pattern, case=False,
+                                                           na=False)
+    out = tagged_news[mask].copy()
+    return out.sort_values("PUBLISHED_DT", ascending=False)
+
+
+def score_recommendations(recs: pd.DataFrame, hist: pd.DataFrame,
+                          horizons=(1, 5, 10)) -> pd.DataFrame:
+    """
+    What happened after each call, against the stock's own base rate.
+
+    The base-rate column is the whole point. A call that returned +2% in a
+    month when the stock averaged +2.5% anyway did not add anything, however
+    good it looked in isolation.
+    """
+    if recs.empty or hist.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for _, r in recs.iterrows():
+        sym = r.get("SYMBOL_MATCH")
+        when = r.get("PUBLISHED_DT")
+        if not sym or pd.isna(when):
+            continue
+        g = hist[hist["SYMBOL"] == sym].sort_values("DATE")
+        if g.empty:
+            continue
+        after = g[g["DATE"] >= pd.Timestamp(when).normalize()]
+        if after.empty:
+            continue
+
+        entry = float(after["CLOSE"].iloc[0])
+        row = {"Date": pd.Timestamp(when).date(), "Symbol": sym,
+               "Source": r.get("SOURCE", ""), "Headline": str(r.get("HEADLINE", ""))[:90],
+               "Price then": entry}
+
+        closes = g["CLOSE"].reset_index(drop=True)
+        base_all = {}
+        for h in horizons:
+            fwd = ((closes.shift(-h) / closes - 1) * 100).dropna()
+            base_all[h] = float(fwd.median()) if len(fwd) else float("nan")
+
+        for h in horizons:
+            if len(after) > h:
+                move = (float(after["CLOSE"].iloc[h]) / entry - 1) * 100
+            else:
+                move = float("nan")
+            row[f"{h}d %"] = move
+            row[f"{h}d vs base"] = (move - base_all[h]
+                                    if move == move and base_all[h] == base_all[h]
+                                    else float("nan"))
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def recommendation_summary(scored: pd.DataFrame, horizon: int = 5) -> dict:
+    """Whether these calls beat doing nothing, and whether the sample supports it."""
+    if scored.empty:
+        return {}
+    col, vs = f"{horizon}d %", f"{horizon}d vs base"
+    moves = scored[col].dropna()
+    edges = scored[vs].dropna() if vs in scored.columns else pd.Series(dtype=float)
+    if moves.empty:
+        return {}
+
+    # Overlapping windows again -- calls cluster in time, so treat the
+    # effective sample conservatively.
+    eff_n = max(len(moves) / max(horizon, 1), 1)
+    se = edges.std() / (eff_n ** 0.5) if len(edges) > 1 else float("inf")
+
+    return {
+        "n": int(len(moves)),
+        "effective_n": eff_n,
+        "hit_rate": float((moves > 0).mean() * 100),
+        "median": float(moves.median()),
+        "median_edge": float(edges.median()) if len(edges) else float("nan"),
+        "beat_base_pct": float((edges > 0).mean() * 100) if len(edges) else float("nan"),
+        "significant": bool(len(edges) > 1 and se != float("inf")
+                            and abs(edges.median()) > 2 * se and eff_n >= 5),
+        "threshold": 2 * se if se != float("inf") else float("nan"),
+    }
+
+
 # ============================================================== GLOSSARY =====
 # Every term the app shows, in plain English. Definitions say what a number
 # measures AND what it does not tell you -- the second half is usually the
@@ -4300,8 +4494,8 @@ st.markdown(f'<div class="pulse-strip">{"".join(cells)}</div>', unsafe_allow_htm
 
 # ================================================================= TABS ======
 
-ALL_TABS = ["Radar", "Trade card", "Options", "Events", "Journal",
-            "Backtest", "Data",
+ALL_TABS = ["Radar", "Trade card", "Reality check", "Media calls",
+            "Options", "Events", "Journal", "Backtest", "Data",
             "Focus list", "Markets", "Sentiment", "Weekly setups",
             "Screener (all NSE)", "Technicals", "Disclosures", "Ownership",
             "Small-cap hunt", "News", "FII / DII", "Ratios", "Order Book",
@@ -4329,6 +4523,7 @@ def tab(name):
 
 
 tab_radar, tab_card = tab("Radar"), tab("Trade card")
+tab_real, tab_media = tab("Reality check"), tab("Media calls")
 tab_events, tab_data = tab("Events"), tab("Data")
 (tab_focus, tab_market, tab_sent, tab_setups, tab_screen, tab_tech, tab_opt,
  tab_disc, tab_own, tab_journal, tab_hunt, tab_test, tab_news, tab_flows,
@@ -4804,6 +4999,190 @@ with tab_card, safe_tab("Trade card"):
                 'buyers and sellers previously showed up, and no guide at all to '
                 'whether they will show up again.</div>',
                 unsafe_allow_html=True)
+
+
+with tab_real, safe_tab("Reality check"):
+    st.markdown("#### Costs and survival")
+    st.markdown(
+        "Two things that decide outcomes more reliably than any signal: what "
+        "each trade costs you before it can profit, and what a normal losing "
+        "streak does to your capital."
+    )
+
+    st.markdown("##### What a round trip actually costs")
+    q1, q2, q3 = st.columns(3)
+    cc_prem = q1.number_input("Premium paid", value=25.0, step=1.0, key="cc_prem")
+    cc_qty = q2.number_input("Quantity (lots x lot size)", value=750, step=25,
+                             key="cc_qty")
+    cc_exit = q3.number_input("Premium on exit", value=25.0, step=1.0,
+                              key="cc_exit",
+                              help="Leave equal to entry to see cost in isolation.")
+
+    with st.expander("Adjust the rates for your broker"):
+        z = {}
+        cz1, cz2, cz3 = st.columns(3)
+        z["brokerage_per_order"] = cz1.number_input(
+            "Brokerage per order", value=DEFAULT_COSTS["brokerage_per_order"],
+            step=5.0, key="cz_brok")
+        z["stt_sell_pct"] = cz2.number_input(
+            "STT on sell %", value=DEFAULT_COSTS["stt_sell_pct"], step=0.01,
+            format="%.3f", key="cz_stt")
+        z["slippage_pct"] = cz3.number_input(
+            "Slippage each way %", value=DEFAULT_COSTS["slippage_pct"], step=0.25,
+            key="cz_slip",
+            help="Half the bid-ask you cross. On thin strikes this is the "
+                 "largest cost by far.")
+        st.caption("Rates change and vary by broker — check yours rather than "
+                   "trusting these defaults.")
+
+    costs = option_trade_costs(cc_prem, cc_exit, int(cc_qty), z)
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Capital deployed", f"Rs {cc_prem * cc_qty:,.0f}")
+    k2.metric("Round-trip cost", f"Rs {costs['Total cost']:,.0f}")
+    k3.metric("Cost as % of capital", f"{costs['Cost as % of capital']:.1f}%",
+              help="The option must gain at least this much before you make "
+                   "anything at all.")
+
+    breakdown = pd.DataFrame([
+        {"Charge": k, "Rupees": costs[k]} for k in
+        ["Brokerage", "STT", "Exchange", "SEBI", "Stamp duty", "GST", "Slippage"]
+    ]).sort_values("Rupees", ascending=False)
+    st.dataframe(breakdown, use_container_width=True, hide_index=True)
+
+    st.markdown(
+        f'<div class="stale">This trade needs the premium to rise '
+        f'<b>{costs["Cost as % of capital"]:.1f}%</b> before you are level. '
+        f'Slippage is usually the biggest line and the one most often left out '
+        f'— it is not a fee, it is the gap between the price you see and the '
+        f'price you get, paid twice. Ten trades a month at this size costs '
+        f'<b>Rs {costs["Total cost"] * 10:,.0f}</b> in friction alone.</div>',
+        unsafe_allow_html=True)
+
+    st.divider()
+    st.markdown("##### What a losing streak does")
+    st.caption("Same statistics, two thousand different orderings. Order matters "
+               "far more than people expect.")
+
+    d1, d2, d3, d4 = st.columns(4)
+    dd_cap = d1.number_input("Capital (Rs)", value=500000.0, step=50000.0, key="dd_cap")
+    dd_risk = d2.number_input("Risk per trade %", value=2.0, step=0.5, key="dd_risk")
+    dd_win = d3.number_input("Win rate %", value=45.0, step=5.0, key="dd_win",
+                             help="Be honest. Use your Journal once you have "
+                                  "thirty closed trades.")
+    dd_r = d4.number_input("Average win, in R", value=1.8, step=0.1, key="dd_r",
+                           help="A 2R average win means winners make twice what "
+                                "losers lose.")
+
+    sim = simulate_drawdown(dd_cap, dd_risk, dd_win, dd_r)
+    e1, e2, e3, e4 = st.columns(4)
+    e1.metric("Expectancy", f"{sim['expectancy_r']:+.2f}R",
+              help="Average result per trade, in units of what you risk. "
+                   "Negative means no amount of sizing saves it.")
+    e2.metric("Median outcome", f"Rs {sim['median_final']:,.0f}",
+              delta=f"{(sim['median_final']/dd_cap-1)*100:+.0f}%")
+    e3.metric("Typical worst drawdown", f"{sim['median_drawdown']:.0f}%")
+    e4.metric("Runs that lost capital", f"{sim['ruin_pct']:.1f}%",
+              help="Share of simulations that fell to a quarter of the starting "
+                   "capital.")
+
+    st.caption(
+        f"Bad case (10th percentile): Rs {sim['p10_final']:,.0f}. "
+        f"Good case (90th): Rs {sim['p90_final']:,.0f}. "
+        f"{sim['losing_runs_pct']:.0f}% of runs finished below where they started."
+    )
+
+    if sim["expectancy_r"] <= 0:
+        st.markdown(
+            '<div class="stale"><b>Expectancy is negative.</b> With these '
+            'numbers no position size produces a profit — smaller sizing only '
+            'slows the decline. The win rate or the average win has to change, '
+            'and neither is something the app can supply.</div>',
+            unsafe_allow_html=True)
+    elif sim["median_drawdown"] > 35:
+        st.markdown(
+            f'<div class="stale"><b>A typical run of this puts you '
+            f'{sim["median_drawdown"]:.0f}% down at some point.</b> That is not '
+            f'the bad case — it is the middle one. Most people stop following '
+            f'a system well before that, which is how a positive expectancy '
+            f'still ends in a loss. Halve the risk per trade and see what '
+            f'happens to both columns.</div>', unsafe_allow_html=True)
+
+
+with tab_media, safe_tab("Media calls"):
+    st.markdown("#### Do media recommendations actually work?")
+    st.markdown(
+        "Your Coal India example is the right instinct, tested rather than "
+        "assumed. This finds recommendation headlines in the archive, tags the "
+        "stock, and measures what happened next — against what that stock did "
+        "anyway over the same window."
+    )
+
+    m_news = load_news_archive()
+    if m_news.empty:
+        st.info("No news archived yet. The collector builds this from its next "
+                "run, and the answer needs a few months of calls to mean "
+                "anything.")
+    else:
+        with st.spinner("Matching calls to stocks…"):
+            m_tagged = tag_news_with_symbols(m_news, symbol_universe())
+            m_recs = find_recommendations(m_tagged)
+            m_scored = score_recommendations(m_recs, cached_history())
+
+        if m_scored.empty:
+            st.info("No recommendation headlines matched to stocks yet.")
+        else:
+            m_h = st.select_slider("Measure over", options=[1, 5, 10], value=5,
+                                   key="mc_h")
+            summ = recommendation_summary(m_scored, m_h)
+
+            s1, s2, s3, s4 = st.columns(4)
+            s1.metric("Calls tracked", summ["n"])
+            s2.metric(f"Went up in {m_h}d", f"{summ['hit_rate']:.0f}%")
+            s3.metric("Median move", f"{summ['median']:+.1f}%")
+            s4.metric("Median edge vs base", f"{summ['median_edge']:+.1f}%",
+                      help="How much better than the stock's own typical move "
+                           "over the same window. This is the number that "
+                           "matters.")
+
+            colour = "#2fbf71" if summ["significant"] else "#c9a227"
+            verdict = ("These calls beat the base rate by more than noise explains"
+                       if summ["significant"] else
+                       f"Not distinguishable from doing nothing — only "
+                       f"{summ['effective_n']:.1f} independent windows so far")
+            st.markdown(
+                f'<div style="border-left:3px solid {colour};padding:0.7rem 1rem;'
+                f'background:#141a21;margin:0.5rem 0;color:#e6eaef;">'
+                f'<b>{verdict}.</b></div>', unsafe_allow_html=True)
+
+            if "Source" in m_scored.columns and len(m_scored) >= 6:
+                by_src = m_scored.groupby("Source").agg(
+                    Calls=(f"{m_h}d %", "size"),
+                    **{"Median %": (f"{m_h}d %", "median")},
+                    **{"Median edge": (f"{m_h}d vs base", "median")},
+                    **{"Hit rate %": (f"{m_h}d %", lambda s: (s > 0).mean() * 100)}
+                ).reset_index().sort_values("Median edge", ascending=False)
+                st.markdown("**By source**")
+                st.dataframe(colour_frame(by_src, ["Median %", "Median edge"]),
+                             use_container_width=True, hide_index=True)
+
+            st.markdown("**Every call**")
+            show = [c for c in ["Date", "Symbol", "Source", "Price then",
+                                "1d %", "5d %", "10d %", f"{m_h}d vs base",
+                                "Headline"] if c in m_scored.columns]
+            st.dataframe(colour_frame(m_scored[show].head(200),
+                                      ["1d %", "5d %", "10d %", f"{m_h}d vs base"]),
+                         use_container_width=True, height=400, hide_index=True)
+
+            st.markdown(
+                '<div class="stale"><b>Why the base-rate column is the one to '
+                'read.</b> A call that returned +4% looks excellent until you '
+                'see the stock averaged +4% over that window anyway. Two further '
+                'cautions: the archive only holds what your collector captured, '
+                'so early results are thin, and a headline appearing after a '
+                'stock has already moved will look prescient without having '
+                'been. If a particular source shows a persistent edge across '
+                'fifty-plus calls, that is worth acting on. Before that, it is '
+                'a sample.</div>', unsafe_allow_html=True)
 
 
 with tab_events, safe_tab("Events"):
