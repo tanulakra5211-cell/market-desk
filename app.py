@@ -31,7 +31,7 @@ st.set_page_config(
 )
 
 DATA_DIR = Path(__file__).parent / "data"
-APP_VERSION = "v26 — clearer trade card"
+APP_VERSION = "v27"
 
 # Which tabs to show. Trimmed to the options workflow; every other tab is
 # still in this file and comes back by adding its name to this list.
@@ -4428,8 +4428,52 @@ with tab_card, safe_tab("Trade card"):
             h1.metric("Spot", f"{c_spot:,.2f}")
             h2.metric("Premium", f"{c_prem:,.2f}",
                       help=f"Lot {lot} — one lot costs Rs {c_prem*lot:,.0f}")
-            h3.metric("IV", f"{c_iv:.1f}%")
+            h3.metric("IV", f"{c_iv:.1f}%",
+                      help="Solved from the premium, not measured from the chart. "
+                           "It is the option's price expressed as volatility.")
             h4.metric("Days to expiry", c_dte)
+
+            # The IV is derived, so its inputs are shown. Any number the app
+            # computes should be checkable against the numbers that produced it.
+            with st.expander("How this IV was calculated"):
+                st.markdown(
+                    f"- Premium used: **{c_prem}** (stored close on {snap})\n"
+                    f"- Spot used: **{c_spot}**\n"
+                    f"- Strike: **{c_strike}** "
+                    f"({(c_strike / c_spot - 1) * 100:+.2f}% from spot)\n"
+                    f"- Days to expiry: **{c_dte}** "
+                    f"({snap} to {pd.Timestamp(c_exp):%Y-%m-%d})\n"
+                    f"- Risk-free rate assumed: **6.5%**\n"
+                    f"- Solved implied volatility: **{c_iv:.4f}%**"
+                )
+                check = bs_price(c_spot, c_strike, c_dte / 365.0, c_iv / 100.0,
+                                 is_call=(c_type == "CE"))
+                st.markdown(
+                    f"Feeding that volatility back through Black-Scholes gives "
+                    f"**{check:.4f}**, against the {c_prem} it started from — "
+                    f"a difference of {abs(check - c_prem):.6f}."
+                )
+                st.caption(
+                    f"That IV implies roughly {c_iv / (252 ** 0.5):.2f}% of "
+                    f"movement per day, or about "
+                    f"{c_iv * ((c_dte / 365) ** 0.5):.1f}% over the "
+                    f"{c_dte} days to expiry."
+                )
+                if solved != solved:
+                    st.warning(
+                        "No implied volatility could be solved from this "
+                        "premium — a default of 30% is being used. Usually the "
+                        "stored close is below intrinsic value or the strike "
+                        "barely traded, so treat every number on this card as "
+                        "unreliable and check the live quote."
+                    )
+                else:
+                    st.caption(
+                        "The premium is a stored **closing** price. On a thinly "
+                        "traded strike that can be stale or a single odd print, "
+                        "which moves the IV a long way. Compare against the live "
+                        "bid and ask before trusting it."
+                    )
 
             if ca is None:
                 st.warning("No price history for the underlying — levels "
